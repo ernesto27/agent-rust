@@ -137,6 +137,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_output_diagnostics_have_no_blank_preview_line() {
+        let cwd = TestDir::new();
+        let mut diagnostics = Vec::new();
+        run("true", &cwd.0, &mut diagnostics).await.unwrap();
+        assert_eq!(
+            String::from_utf8(diagnostics).unwrap(),
+            "$ true\nexit code: 0\n"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_command_cwd_and_null_stdin() {
         let cwd = TestDir::new();
         for (command, expected) in [

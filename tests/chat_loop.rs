@@ -412,6 +412,30 @@ async fn empty_reply_is_printed_and_retained_and_only_first_choice_is_used() {
 }
 
 #[tokio::test]
+async fn explicit_null_tool_calls_are_treated_as_absent() {
+    let reply = Reply::Http(
+        200,
+        format!(
+            "{}{}{}data: [DONE]\n\n",
+            event(
+                json!({"choices": [{"delta": {"role": "assistant", "content": "Hi", "tool_calls": null}}]})
+            ),
+            event(json!({"choices": [{"delta": {"content": " there", "tool_calls": null}}]})),
+            event(json!({"choices": [{"delta": {"tool_calls": null}, "finish_reason": "stop"}]})),
+        ),
+    );
+    let (output, requests, _) = run(b"first\nsecond\n", vec![reply, answer("ok")], |_| {}).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Hi there\nok\n");
+    assert_eq!(stderr(&output), "> > > ");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].body["messages"][2],
+        json!({"role": "assistant", "content": "Hi there"})
+    );
+}
+
+#[tokio::test]
 async fn second_turn_failures_preserve_first_reply_and_do_not_submit_third_turn() {
     let cases = [
         (

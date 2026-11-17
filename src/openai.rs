@@ -37,8 +37,8 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatDelta {
     content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ToolCallDelta>,
+    // Some compatible servers send an explicit `null` instead of omitting it.
+    tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
 pub async fn chat(
@@ -110,7 +110,7 @@ pub async fn chat(
             content.push_str(&fragment);
             saw_content = true;
         }
-        for delta in choice.delta.tool_calls {
+        for delta in choice.delta.tool_calls.into_iter().flatten() {
             tools.push(delta)?;
         }
         if finish_reason.is_none() {
@@ -325,6 +325,28 @@ mod tests {
         assert_eq!(commands[0].command, "printf hi");
         assert_eq!(commands[1].command, "printf \"🌍\"");
         assert_eq!(serde_json::to_value(&calls[0]).unwrap()["type"], "function");
+    }
+
+    #[test]
+    fn null_continuation_metadata_is_treated_as_absent() {
+        let (calls, commands) = assemble(vec![
+            call(0, "a", "{\"command\":"),
+            json!({"index":0,"id":null,"type":null,"function":{"name":null,"arguments":"\"true\"}"}}),
+            json!({"index":0,"id":null,"type":null,"function":null}),
+            json!({"index":0,"function":{"arguments":null}}),
+        ])
+        .unwrap();
+        assert_eq!(calls[0].id, "a");
+        assert_eq!(calls[0].function.arguments, "{\"command\":\"true\"}");
+        assert_eq!(commands[0].command, "true");
+        for field in ["id", "type"] {
+            let mut null = call(0, "a", "{\"command\":\"true\"}");
+            null[field] = json!(null);
+            assert!(assemble(vec![null]).is_err(), "accepted null {field}");
+        }
+        let mut null_name = call(0, "a", "{\"command\":\"true\"}");
+        null_name["function"]["name"] = json!(null);
+        assert!(assemble(vec![null_name]).is_err());
     }
 
     #[test]
