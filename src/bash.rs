@@ -16,7 +16,9 @@ struct BashResult<'a> {
 }
 
 pub async fn run(command: &str, cwd: &Path, stderr: &mut impl Write) -> Result<String> {
-    writeln!(stderr, "$ {command}").context("Failed to write bash command")?;
+    // The echo is one line: escaping newlines and controls keeps it unspoofable.
+    writeln!(stderr, "$ {}", display_safe(command, false))
+        .context("Failed to write bash command")?;
     stderr.flush().context("Failed to flush bash command")?;
 
     let (mut reader, writer) = std::io::pipe().context("Failed to create bash output pipe")?;
@@ -28,6 +30,8 @@ pub async fn run(command: &str, cwd: &Path, stderr: &mut impl Write) -> Result<S
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
+        // Avoid accidental key disclosure (e.g. `env`); this is not a sandbox.
+        .env_remove("OPENAI_API_KEY")
         .stdin(Stdio::null())
         .stdout(writer)
         .stderr(error_writer);
@@ -58,7 +62,8 @@ pub async fn run(command: &str, cwd: &Path, stderr: &mut impl Write) -> Result<S
     } else {
         writeln!(stderr, "termination: {status}").context("Failed to write bash status")?;
     }
-    let (preview, omitted) = preview(&output);
+    // Limits apply to the escaped text, so the displayed preview stays bounded.
+    let (preview, omitted) = preview(&display_safe(&output, true));
     write!(stderr, "{preview}").context("Failed to write bash output preview")?;
     if !preview.is_empty() && !preview.ends_with('\n') {
         writeln!(stderr).context("Failed to write bash output preview")?;
@@ -84,6 +89,20 @@ fn preview(output: &str) -> (String, bool) {
         }
     }
     (output.to_owned(), false)
+}
+
+/// Escapes terminal control characters (C0 except tab, DEL, and C1) for
+/// human-facing display, so output cannot move the cursor or inject sequences.
+fn display_safe(text: &str, keep_newlines: bool) -> String {
+    let mut safe = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() && character != '\t' && !(keep_newlines && character == '\n') {
+            safe.extend(character.escape_default());
+        } else {
+            safe.push(character);
+        }
+    }
+    safe
 }
 
 #[cfg(test)]
@@ -260,6 +279,43 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("spawn bash"), "{error:#}");
+    }
+
+    #[test]
+    fn display_safe_escapes_terminal_controls() {
+        let input = "a\tb\nc\rd\x1b[2K\x07\x7f\u{9b}31m\u{a0}é🌍";
+        assert_eq!(
+            display_safe(input, true),
+            "a\tb\nc\\rd\\u{1b}[2K\\u{7}\\u{7f}\\u{9b}31m\u{a0}é🌍"
+        );
+        assert_eq!(
+            display_safe(input, false),
+            "a\tb\\nc\\rd\\u{1b}[2K\\u{7}\\u{7f}\\u{9b}31m\u{a0}é🌍"
+        );
+        // Preview limits bound the escaped text, not the raw output.
+        let (shown, omitted) = preview(&display_safe(&"\x1b".repeat(400), true));
+        assert_eq!(shown, "\\u{1b}".repeat(400)[..2000]);
+        assert!(omitted);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_escape_controls_but_result_keeps_raw_output() {
+        let cwd = TestDir::new();
+        let mut diagnostics = Vec::new();
+        let command = "touch x; #\r\x1b[2K$ ls\nprintf 'ok\\r\\033]0;title\\007\\nnext\\n'";
+        let result = run(command, &cwd.0, &mut diagnostics).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&result).unwrap(),
+            json!({"output":"ok\r\x1b]0;title\x07\nnext\n","exit_code":0})
+        );
+        assert!(cwd.0.join("x").exists());
+        assert_eq!(
+            String::from_utf8(diagnostics).unwrap(),
+            "$ touch x; #\\r\\u{1b}[2K$ ls\\nprintf 'ok\\r\\033]0;title\\007\\nnext\\n'\n\
+             exit code: 0\n\
+             ok\\r\\u{1b}]0;title\\u{7}\n\
+             next\n"
+        );
     }
 
     #[test]

@@ -1081,6 +1081,31 @@ async fn nonzero_exit_returns_to_model_with_merged_output() {
 }
 
 #[tokio::test]
+async fn bash_child_does_not_inherit_api_key() {
+    let (output, requests, _) = run(
+        b"env\n/exit\n",
+        vec![
+            tool_completion(&[bash_call(
+                0,
+                "a",
+                "printenv OPENAI_API_KEY; echo rc=$?; env | grep -c dummy''-key",
+            )]),
+            answer("Absent."),
+        ],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Absent.\n");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_result(&requests[1], 3, "a"),
+        json!({"output":"rc=1\n0\n","exit_code":1})
+    );
+    assert!(!stderr(&output).contains("dummy-key"));
+}
+
+#[tokio::test]
 async fn tool_stdin_does_not_consume_next_turn() {
     let (output, requests, _) = run(
         b"first\nqueued second\n/exit\n",
