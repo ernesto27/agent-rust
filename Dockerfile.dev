@@ -1,0 +1,9 @@
+FROM docker.io/library/rust:1.99.1-bookworm
+
+# Match rust-toolchain.toml; the base image uses the minimal Rust profile.
+RUN rustup component add --toolchain 1.99.1 rustfmt clippy
+
+# The repository is mounted here at runtime.
+WORKDIR /workspace
+
+CMD ["bash"]
