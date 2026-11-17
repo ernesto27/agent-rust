@@ -166,8 +166,13 @@ async fn chat(
             done = true;
             break;
         }
-        let chunk: ChatChunk = serde_json::from_str(&event.data)
-            .context("Failed to parse Chat Completions stream chunk")?;
+        // Include the raw data so in-stream provider errors reach stderr.
+        let chunk: ChatChunk = serde_json::from_str(&event.data).with_context(|| {
+            format!(
+                "Failed to parse Chat Completions stream chunk: {}",
+                event.data
+            )
+        })?;
         let Some(choice) = chunk.choices.into_iter().next() else {
             ensure!(
                 chunk.usage.is_some(),

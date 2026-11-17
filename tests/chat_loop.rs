@@ -579,6 +579,21 @@ async fn partial_second_turn_failures_keep_flushed_text_without_newline_or_third
             Reply::Http(200, format!("{}data: bad json\n\n", text_event("partial"))),
             "Failed to parse Chat Completions stream chunk",
         ),
+        // An in-stream provider error after HTTP 200 surfaces its message.
+        (
+            Reply::Http(
+                200,
+                format!(
+                    "{}{}",
+                    text_event("partial"),
+                    event(json!({"error": {
+                        "message": "The server had an error while processing your request.",
+                        "type": "server_error"
+                    }}))
+                ),
+            ),
+            "The server had an error while processing your request.",
+        ),
         (
             Reply::Http(200, format!("{}data: [DONE]\n\n", text_event("partial"))),
             "contained no finish_reason",
