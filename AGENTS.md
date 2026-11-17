@@ -44,11 +44,13 @@ is a future design.
 - `OPENAI_BASE_URL`: defaults to `https://api.openai.com/v1`.
 - `OPENAI_MODEL`: defaults to `gpt-4.1`.
 
-With the key exported, run the current one-question CLI with:
+With the key exported, start the chat loop and enter one message per line:
 
 ```bash
-cargo run -- "say hi"
+cargo run
 ```
+
+Quit with `/exit` or end-of-input (Ctrl-D on Unix).
 
 ## Validation
 

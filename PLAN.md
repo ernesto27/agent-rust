@@ -46,11 +46,15 @@ The goal is the smallest coding agent that works, built one step at a time, foll
 **Done when:** `cargo run -- "say hi"` prints the model's reply.
 
 ### Step 3: Chat loop (REPL)
-- [ ] Read lines from stdin in a loop. Keep `history: Vec<ChatMessage>`, append the user message, call the API, append the assistant message.
-- [ ] The **first message** is the system prompt, `{ "role": "system", "content": "..." }`. Make it tiny, pi style, about 5 lines: who you are, be concise, work in the cwd.
-- [ ] `/exit` or Ctrl-D quits.
+- [x] Read lines from stdin in a loop. Keep `history: Vec<ChatMessage>`, append the user message, call the API, append the assistant message.
+- [x] The **first message** is the system prompt, `{ "role": "system", "content": "..." }`. Make it tiny, pi style, about 5 lines: who you are, be concise, work in the cwd.
+- [x] `/exit` or Ctrl-D quits.
 
 **Done when:** you can have a multi-turn conversation and the model remembers earlier turns.
+
+Implemented per [SPEC-chat-loop.md](SPEC-chat-loop.md). Verified with subprocess
+integration tests and local HTTP mocks (no live provider calls), including exact
+two-turn history, cwd, input handling, configuration, and fail-fast errors.
 
 ### Step 4: Streaming
 - [ ] Add `"stream": true` and `"stream_options": { "include_usage": true }`, plus the `futures` and `eventsource-stream` dependencies.
