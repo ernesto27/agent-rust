@@ -1,0 +1,36 @@
+{
+  "agentSandbox": {
+    "agent": "codex",
+    "effort": "high",
+    "hn": false,
+    "model": "gpt-6.1-sol",
+    "pr": true,
+    "push": true
+  },
+  "documents": [],
+  "stages": {
+    "codeReview": {
+      "agent": "claude",
+      "effort": "high",
+      "model": "claude-opus-5-5"
+    },
+    "implementation": {
+      "effort": "high"
+    },
+    "reviewChanges": {
+      "agent": "codex",
+      "effort": "medium",
+      "model": "gpt-6.1-terra"
+    },
+    "riskClassification": {
+      "disabled": true,
+      "effort": "medium"
+    },
+    "securityReview": {
+      "agent": "claude",
+      "effort": "high",
+      "model": "claude-opus-5-5",
+      "saveFindings": false
+    }
+  }
+}
