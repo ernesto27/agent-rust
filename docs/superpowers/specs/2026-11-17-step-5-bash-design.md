@@ -1,6 +1,6 @@
 # Design delta: Step 5 tool plumbing and bash — V1
 
-Status: proposed
+Status: approved by the user on 2026-11-17
 
 ## Intent and scope
 
