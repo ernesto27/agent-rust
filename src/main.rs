@@ -4,6 +4,8 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use eventsource_stream::Eventsource;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -19,19 +21,30 @@ struct ChatMessage {
 struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
+    stream: bool,
+    stream_options: StreamOptions,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Deserialize)]
-struct ChatResponse {
+struct ChatChunk {
     choices: Vec<ChatChoice>,
-    #[serde(rename = "usage")]
-    _usage: Option<serde_json::Value>,
+    usage: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
 struct ChatChoice {
-    message: ChatMessage,
+    delta: ChatDelta,
     finish_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChatDelta {
+    content: Option<String>,
 }
 
 #[tokio::main]
@@ -100,11 +113,8 @@ async fn main() -> Result<()> {
             role: "user".to_owned(),
             content: Some(line.clone()),
         });
-        let message = chat(&client, &url, &api_key, &model, &history).await?;
-        // chat validates content before the message can enter history.
-        writeln!(stdout, "{}", message.content.as_deref().unwrap())
-            .context("Failed to write assistant reply")?;
-        stdout.flush().context("Failed to flush assistant reply")?;
+        let message = chat(&client, &url, &api_key, &model, &history, &mut stdout).await?;
+        // Only completed streams with successfully flushed output enter history.
         history.push(message);
     }
 
@@ -117,10 +127,15 @@ async fn chat(
     api_key: &str,
     model: &str,
     history: &[ChatMessage],
+    stdout: &mut impl Write,
 ) -> Result<ChatMessage> {
     let request = ChatRequest {
         model,
         messages: history,
+        stream: true,
+        stream_options: StreamOptions {
+            include_usage: true,
+        },
     };
 
     let response = client
@@ -132,27 +147,67 @@ async fn chat(
         .context("Failed to send Chat Completions request")?;
 
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .context("Failed to read API response")?;
-    ensure!(status.is_success(), "API error ({status}):\n{body}");
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .with_context(|| format!("Failed to read API error response ({status})"))?;
+        anyhow::bail!("API error ({status}):\n{body}");
+    }
 
-    let response: ChatResponse =
-        serde_json::from_str(&body).context("Failed to parse Chat Completions response")?;
-    let choice = response
-        .choices
-        .into_iter()
-        .next()
-        .context("API response contained no choices")?;
-    choice.message.content.as_deref().with_context(|| {
-        format!(
-            "API response contained no message content (finish_reason: {})",
-            choice.finish_reason.as_deref().unwrap_or("unknown")
-        )
-    })?;
-
-    Ok(choice.message)
+    let mut events = response.bytes_stream().eventsource();
+    let mut content = String::new();
+    let mut saw_content = false;
+    let mut finish_reason = None;
+    let mut done = false;
+    while let Some(event) = events.next().await {
+        let event = event.context("Failed to decode Chat Completions SSE stream")?;
+        if event.data == "[DONE]" {
+            done = true;
+            break;
+        }
+        // Include the raw data so in-stream provider errors reach stderr.
+        let chunk: ChatChunk = serde_json::from_str(&event.data).with_context(|| {
+            format!(
+                "Failed to parse Chat Completions stream chunk: {}",
+                event.data
+            )
+        })?;
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            ensure!(
+                chunk.usage.is_some(),
+                "API stream chunk contained no choices or usage"
+            );
+            continue;
+        };
+        if let Some(fragment) = choice.delta.content {
+            stdout
+                .write_all(fragment.as_bytes())
+                .context("Failed to write assistant reply")?;
+            stdout.flush().context("Failed to flush assistant reply")?;
+            content.push_str(&fragment);
+            saw_content = true;
+        }
+        if finish_reason.is_none() {
+            finish_reason = choice.finish_reason;
+        }
+    }
+    ensure!(done, "Chat Completions stream ended before [DONE]");
+    ensure!(
+        saw_content,
+        "API response contained no message content (finish_reason: {})",
+        finish_reason.as_deref().unwrap_or("unknown")
+    );
+    ensure!(
+        finish_reason.is_some(),
+        "Chat Completions stream contained no finish_reason"
+    );
+    writeln!(stdout).context("Failed to write assistant reply")?;
+    stdout.flush().context("Failed to flush assistant reply")?;
+    Ok(ChatMessage {
+        role: "assistant".to_owned(),
+        content: Some(content),
+    })
 }
 
 fn env_or_default(name: &str, default: &str) -> Result<String> {

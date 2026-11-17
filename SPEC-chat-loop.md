@@ -1,13 +1,14 @@
-# Spec: Step 3 Chat Loop — V1
+# Spec: Chat Loop with Step 4 Streaming — V1
 
 Status: approved
 
 ## Objective
 
 Replace the one-question CLI with a minimal line-based REPL so later turns include
-earlier messages. This implements [PLAN.md Step 3](PLAN.md#step-3-chat-loop-repl);
-later steps remain deferred. Success means launching `cargo run`, exchanging
-multiple turns, and quitting with `/exit` or end-of-input.
+earlier messages. This implements [PLAN.md Step 3](PLAN.md#step-3-chat-loop-repl) and
+[Step 4](PLAN.md#step-4-streaming); later steps remain deferred. Success means
+launching `cargo run`, seeing text as it arrives, exchanging multiple turns, and
+quitting with `/exit` or end-of-input.
 
 ## Previous behavior
 
@@ -50,38 +51,69 @@ already existed.
   ```
 
 - For each accepted line, append a user message, send the entire history to
-  `{base_url}/chat/completions`, validate the response, append the first choice's
-  assistant message, and print its content followed by a newline.
+  `{base_url}/chat/completions`, stream the first choice's content, validate
+  completion, print and flush one terminating newline, then append exactly one
+  assistant message containing the concatenated deltas.
 - Send the configured model and Bearer authorization. Reuse one HTTP client.
-  Keep typed serde request/response structures and nonstreaming behavior.
+  Include `"stream": true` and `"stream_options": {"include_usage": true}` in
+  every request. Keep typed serde request, chunk, choice, and delta structures.
 - Send requests sequentially. Do not read the next turn while awaiting a reply.
-- Print only complete assistant replies on stdout, without role labels, banners,
-  usage reports, or echoed input. Prompts and errors belong on stderr.
+- Write each string content delta to the locked stdout and flush immediately,
+  preserving exact whitespace and Unicode. Accumulate the same fragments without
+  reprinting them. Prompts and errors belong on stderr; no role labels, banners,
+  raw SSE, usage reports, or echoed input appear on stdout.
+
+### Streaming and completion
+
+- Check HTTP status before decoding a successful body incrementally with
+  `eventsource-stream` and `futures` over reqwest's byte stream. Parse SSE event
+  data without requiring event names; `[DONE]` is the end marker. The decoder
+  handles blank-line event boundaries, LF/CRLF, comments, multiline data, and
+  network boundaries within JSON or UTF-8 characters.
+- Decode other event data as typed JSON chunks, ignoring unrelated fields. Use
+  the first choice when choices are nonempty. Optional `delta.content` may be
+  absent or null; role-only and empty deltas emit no text.
+- Record the first non-null finish reason from the first choice. Continue
+  consuming events afterward to accept a usage chunk and `[DONE]`.
+- Empty choices with non-null usage are valid. Empty choices without usage are
+  errors. Usage itself is optional; do not display, persist, or calculate costs
+  from it.
+- Success requires `[DONE]`, a recorded finish reason, and at least one string
+  content delta. An explicit empty string counts, prints a terminating newline,
+  and is retained as an empty assistant reply. Missing-content errors include
+  the finish reason or `unknown`.
+- Only after successful validation and the terminating newline's write/flush
+  may the complete assistant message enter history. Later requests include it
+  exactly once.
 
 ### Failure handling
 
 - Any configuration, cwd, input/output, transport, HTTP, or response-parsing
   failure ends the process with context on stderr and nonzero status.
 - Preserve HTTP status and response body in errors for unsuccessful responses.
-- Empty choices and missing/null message content remain errors, including the
-  existing finish-reason context for missing content. Empty-string content prints
-  a newline and retains the assistant message.
+- Transport/SSE decoding errors, malformed JSON, invalid chunk shapes, empty
+  choices without usage, premature EOF without `[DONE]`, missing finish reason,
+  and missing string content are fatal. A finish reason without `[DONE]` is
+  insufficient, as is `[DONE]` without a finish reason.
+- A failed stream leaves already flushed text visible without a success newline.
+  Do not erase it, replay the request, fabricate completion, append partial
+  history, or submit a queued next turn. Output write/flush failures are fatal.
 - Do not retry or return to the prompt after failure. Earlier successful replies
   remain on stdout; no fabricated assistant message is added.
 
 ## Tech stack and structure
 
-Rust edition 2024, one binary crate. Existing dependency declarations are
-`anyhow = 1.0.104`, `reqwest = 0.12` (JSON and rustls), `serde = 1.0.229`
-(derive), `serde_json = 1.0.154`, and `tokio = 1.54.1` (full). Resolved versions
-remain governed by tracked `Cargo.lock`. No new dependency is expected.
+Rust edition 2024, one binary crate. Use `anyhow`, `reqwest` (JSON, rustls,
+and stream), `serde` (derive), `serde_json`, `tokio` (full), `futures`, and
+`eventsource-stream`. Resolved versions remain governed by tracked `Cargo.lock`.
 
 - `src/main.rs`: configuration, wire types, HTTP handling, and the small REPL;
   keep production code here until it exceeds roughly 300 lines.
 - `tests/chat_loop.rs`: subprocess integration tests using stdin/stdout/stderr
-  and a local HTTP mock built from existing facilities.
+  and a local HTTP mock, including chunked SSE fixtures and a timeout-bounded
+  stdout handshake proving incremental flushing.
 - `SPEC-chat-loop.md`: this feature's requirements.
-- `PLAN.md`: implementation progress; check Step 3 only after verification.
+- `PLAN.md`: implementation progress; check each step only after verification.
 - `AGENTS.md`: update its running example to show `cargo run`.
 - `Cargo.lock`: stays tracked; `/target` stays ignored.
 
@@ -119,27 +151,33 @@ percentage target is required. Cover these observable contracts:
    contents, configured model, path, and dummy authorization header.
 3. The system message occurs once, contains the subprocess cwd, and stays
    unchanged between requests. Run the subprocess in a throwaway directory.
-4. Prompts appear on stderr and complete reply text appears only on stdout.
+4. Prompts appear on stderr; exact deltas followed by one added success newline
+   appear only on stdout. A bounded handshake proves output before stream completion.
 5. Blank lines make no request; CRLF input and a final line without newline work.
 6. `/exit`, whitespace-padded `/exit`, and EOF exit with status zero. Input after
    `/exit` is not processed. Other slash-prefixed text is submitted normally.
 7. A failure on the second request exits nonzero, preserves the first reply,
    and does not submit a queued third turn. Cover HTTP errors with body, malformed
-   JSON, empty choices, missing content, and a transport failure.
+   JSON, invalid chunks, empty choices without usage, missing content or finish
+   reason, EOF before `[DONE]`, and transport/SSE failures after partial output.
 8. Missing/blank API keys fail before input or HTTP. Base URL and model defaults
    remain intact, with overrides checked using the mock.
-9. Formatting, locked build, and locked tests pass. Report whether verification
-   used mocks or a live provider.
+9. Cover role-only, null/missing content, explicit empty strings, first-choice
+   behavior, optional usage, multiline data, comments, LF/CRLF, and JSON/Unicode
+   split across network writes; include multiple events in one write. Check
+   stdout write/flush failures stop the next turn.
+10. Formatting, locked build, and locked tests pass. Report whether verification
+    used mocks or a live provider.
 
 ## Boundaries
 
-- Always follow Step 3 scope, use contextual errors, preserve stdout/stderr
-  separation, run required checks, and update Step 3 only after verification.
+- Always stay within Steps 3–4, use contextual errors, preserve stdout/stderr
+  separation, run required checks, and update progress only after verification.
 - Ask first before expanding beyond this spec, adding dependencies, or changing CI.
 - Never print or commit API keys, make paid calls for automated validation,
   remove failing tests to pass checks, or alter unrelated user changes.
 
-Streaming is deferred to Step 4. Tool execution is deferred to Phase 2. Saved
+Tool execution and streaming tool calls are deferred to Phase 2. Saved
 sessions, resume, compaction, context limits, multiline editing, input history,
 TUI, special Ctrl-C handling, retries, recovery, extra commands, and print mode
 are out of scope. Retain normal process signal behavior. Loading project
@@ -148,6 +186,6 @@ this step includes only the cwd in the tiny system prompt.
 
 ## Open questions
 
-None blocking. Approval includes rejecting arguments, preserving input whitespace
-except line endings, trimmed `/exit` recognition, prompts for piped input, and
-the five-line system prompt above.
+None blocking. Approval includes the inherited input/system-prompt behavior,
+finish reason plus `[DONE]`, optional usage, missing-content policy, and fail-fast
+partial-output behavior above.
