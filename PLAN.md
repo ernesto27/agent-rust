@@ -76,10 +76,10 @@ history, optional usage, partial failures, and stdout write/flush errors.
 ## Phase 2: Become an agent (tools)
 
 ### Step 5: Tool plumbing + `bash`
-- [ ] Extend the types:
+- [x] Extend the types:
   - An assistant message can have `tool_calls: [{ id, type: "function", function: { name, arguments } }]`. Note that `arguments` is a **JSON string**, not an object.
   - Add a `tool` role message: `{ "role": "tool", "tool_call_id": "...", "content": "..." }`.
-- [ ] Send a `tools` array with one tool, `bash`:
+- [x] Send a `tools` array with one tool, `bash`:
   ```json
   { "type": "function",
     "function": { "name": "bash",
@@ -88,14 +88,21 @@ history, optional usage, partial failures, and stdout write/flush errors.
                                   "properties": { "command": { "type": "string" } },
                                   "required": ["command"] } } }
   ```
-- [ ] Streaming: tool calls arrive in `delta.tool_calls[]`, keyed by `index`.
+- [x] Streaming: tool calls arrive in `delta.tool_calls[]`, keyed by `index`.
   - The first fragment for an index carries `id` and `function.name`. Later fragments append to `function.arguments`.
   - Accumulate per index, and parse the arguments with `serde_json::from_str` once the stream ends (`finish_reason: "tool_calls"`).
-- [ ] Run the command with `tokio::process::Command::new("bash").arg("-c")`, merging stdout and stderr and capturing the exit code.
-- [ ] **The agent loop:** while the last assistant message has `tool_calls`, run each one and push **one `tool` message per call** (matching `tool_call_id`), then call the API again. Stop when there are no tool calls.
-- [ ] Print each tool call (`$ <command>`) and a short preview of the output, so you can see what happens.
+- [x] Run the command with `tokio::process::Command::new("bash").arg("-c")`, merging stdout and stderr and capturing the exit code.
+- [x] **The agent loop:** while the last assistant message has `tool_calls`, run each one and push **one `tool` message per call** (matching `tool_call_id`), then call the API again. Stop when there are no tool calls.
+- [x] Print each tool call (`$ <command>`) and a short preview of the output, so you can see what happens.
 
 **Done when:** "what files are in this folder?" makes the model run `ls` and answer from the output.
+
+Implemented per the [approved Step 5 design](docs/superpowers/specs/2026-11-17-step-5-bash-design.md)
+and incorporated into [SPEC-chat-loop.md](SPEC-chat-loop.md). Verified with
+9 unit tests, 24 subprocess/local HTTP mock tests, the required formatting and
+locked build/test checks, and a `cargo run --locked` folder-listing smoke check
+in a throwaway directory. No live provider or paid calls. Model-visible tool
+results retain full merged output; Step 6 guard rails remain deferred.
 
 ### Step 6: Guard rails for `bash`
 - [ ] Timeout, 120 s by default, optionally set with `timeout_ms` in the arguments. Kill the process on timeout.
