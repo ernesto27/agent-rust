@@ -57,13 +57,19 @@ integration tests and local HTTP mocks (no live provider calls), including exact
 two-turn history, cwd, input handling, configuration, and fail-fast errors.
 
 ### Step 4: Streaming
-- [ ] Add `"stream": true` and `"stream_options": { "include_usage": true }`, plus the `futures` and `eventsource-stream` dependencies.
-- [ ] The SSE stream has no event names. Each `data:` line is a JSON chunk, and the stream ends with `data: [DONE]`.
-- [ ] Each chunk has `choices[0].delta.content` (a text fragment) and, on the last real chunk, `choices[0].finish_reason`. With `include_usage`, a final chunk with empty `choices` carries `usage`.
-- [ ] Print text deltas as they arrive (`print!` + `flush`).
-- [ ] Rebuild the full assistant message from the deltas and push it to the history.
+- [x] Add `"stream": true` and `"stream_options": { "include_usage": true }`, plus the `futures` and `eventsource-stream` dependencies.
+- [x] Decode SSE event data without requiring event names; each event carries a JSON chunk or the `[DONE]` end marker.
+- [x] Consume optional `choices[0].delta.content` fragments and record the first non-null `finish_reason`. Continue through optional usage-only chunks with empty `choices` to `[DONE]`.
+- [x] Print text deltas as they arrive (`print!` + `flush`).
+- [x] Rebuild the full assistant message from the deltas and push it to the history.
 
 **Done when:** text appears word by word, and multi-turn still works.
+
+Implemented per the approved Step 4 streaming delta and incorporated into
+[SPEC-chat-loop.md](SPEC-chat-loop.md). Verified with 16 subprocess integration
+tests and a `cargo run` smoke check against local HTTP mocks (no live provider
+calls), including bounded stdout handshakes, split SSE/JSON/Unicode, exact
+history, optional usage, partial failures, and stdout write/flush errors.
 
 ---
 
