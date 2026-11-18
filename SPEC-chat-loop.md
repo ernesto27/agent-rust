@@ -114,7 +114,11 @@ already existed.
   as one argument, null stdin, and explicit startup cwd. Each call is a fresh shell;
   `cd` and shell variables do not persist. REPL input stays reserved for the agent.
   Remove `OPENAI_API_KEY` from the child environment; the parent retains it for HTTP
-  authorization so command output cannot expose it through environment inspection.
+  authorization. This only keeps the key out of the child shell's own environment
+  (scripts that need the key will not see it); it is not isolation. Commands run
+  with the agent's privileges and can still read the agent's environment (for
+  example via `/proc` of the parent process) or other files. Real sandboxing and
+  permissions are out of scope for Step 5.
 - Merge stdout and stderr into one pipe at launch. Drain it concurrently with the
   child to avoid pipe-buffer deadlocks, capture termination status, and decode the
   full output as UTF-8 lossily.
