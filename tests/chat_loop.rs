@@ -1,237 +1,9 @@
-use std::{
-    collections::VecDeque,
-    fs,
-    path::PathBuf,
-    process::{Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+mod support;
 
 use serde_json::{Value, json};
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
-    process::Command,
-    sync::oneshot,
-    time::timeout,
-};
-
-struct TestDir(PathBuf);
-
-impl TestDir {
-    fn new() -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "agent-chat-loop-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).unwrap();
-        Self(path.canonicalize().unwrap())
-    }
-}
-
-impl Drop for TestDir {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
-    }
-}
-
-#[derive(Debug)]
-struct Request {
-    start_line: String,
-    headers: Vec<(String, String)>,
-    body: Value,
-}
-
-enum Reply {
-    Http(u16, String),
-    Disconnect,
-    Stream {
-        parts: Vec<Vec<u8>>,
-        after_first: Option<oneshot::Receiver<()>>,
-        truncated: bool,
-    },
-}
-
-fn event(chunk: Value) -> String {
-    format!("data: {chunk}\n\n")
-}
-
-fn text_event(content: &str) -> String {
-    event(json!({"choices": [{"delta": {"content": content}}]}))
-}
-
-fn finish_event() -> String {
-    event(json!({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
-}
-
-fn completion(fragments: &[&str]) -> Reply {
-    let mut body: String = fragments
-        .iter()
-        .map(|fragment| text_event(fragment))
-        .collect();
-    body.push_str(&finish_event());
-    body.push_str("data: [DONE]\n\n");
-    Reply::Http(200, body)
-}
-
-fn answer(content: &str) -> Reply {
-    completion(&[content])
-}
-
-async fn read_request(stream: &mut BufReader<TcpStream>) -> Request {
-    let mut start_line = String::new();
-    stream.read_line(&mut start_line).await.unwrap();
-    let mut headers = Vec::new();
-    loop {
-        let mut line = String::new();
-        assert_ne!(stream.read_line(&mut line).await.unwrap(), 0);
-        if line == "\r\n" {
-            break;
-        }
-        let (name, value) = line.trim_end().split_once(':').unwrap();
-        headers.push((name.to_ascii_lowercase(), value.trim().to_owned()));
-    }
-    let length = headers
-        .iter()
-        .find(|(name, _)| name == "content-length")
-        .unwrap()
-        .1
-        .parse::<usize>()
-        .unwrap();
-    let mut body = vec![0; length];
-    stream.read_exact(&mut body).await.unwrap();
-    Request {
-        start_line,
-        headers,
-        body: serde_json::from_slice(&body).unwrap(),
-    }
-}
-
-async fn run(
-    input: &[u8],
-    replies: Vec<Reply>,
-    configure: impl FnOnce(&mut Command),
-) -> (Output, Vec<Request>, PathBuf) {
-    run_with_handshake(input, replies, configure, None).await
-}
-
-async fn run_with_handshake(
-    input: &[u8],
-    replies: Vec<Reply>,
-    configure: impl FnOnce(&mut Command),
-    handshake: Option<(&[u8], oneshot::Sender<()>)>,
-) -> (Output, Vec<Request>, PathBuf) {
-    let cwd = TestDir::new();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}/v1///", listener.local_addr().unwrap());
-    let (stop, mut stopped) = oneshot::channel();
-    let server = tokio::spawn(async move {
-        let mut replies: VecDeque<_> = replies.into();
-        let mut requests = Vec::new();
-        loop {
-            let (stream, _) = tokio::select! {
-                _ = &mut stopped => break,
-                accepted = listener.accept() => accepted.unwrap(),
-            };
-            let mut stream = BufReader::new(stream);
-            requests.push(
-                timeout(Duration::from_secs(5), read_request(&mut stream))
-                    .await
-                    .expect("client did not finish sending its request"),
-            );
-            match replies
-                .pop_front()
-                .unwrap_or(Reply::Http(500, "unexpected extra request".to_owned()))
-            {
-                Reply::Http(status, body) => {
-                    let response = format!(
-                        "HTTP/1.1 {status} Mock\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    stream.write_all(response.as_bytes()).await.unwrap();
-                    stream.flush().await.unwrap();
-                }
-                Reply::Disconnect => {}
-                Reply::Stream {
-                    parts,
-                    mut after_first,
-                    truncated,
-                } => {
-                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
-                    for (index, part) in parts.iter().enumerate() {
-                        stream
-                            .write_all(format!("{:x}\r\n", part.len()).as_bytes())
-                            .await
-                            .unwrap();
-                        stream.write_all(part).await.unwrap();
-                        stream.write_all(b"\r\n").await.unwrap();
-                        stream.flush().await.unwrap();
-                        if index == 0
-                            && let Some(proceed) = after_first.take()
-                        {
-                            timeout(Duration::from_secs(5), proceed)
-                                .await
-                                .expect("stdout fragment was not flushed before remainder")
-                                .expect("stdout observer dropped the handshake");
-                        }
-                    }
-                    if !truncated {
-                        stream.write_all(b"0\r\n\r\n").await.unwrap();
-                    }
-                }
-            }
-        }
-        requests
-    });
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent"));
-    command
-        .current_dir(&cwd.0)
-        .env("OPENAI_API_KEY", "dummy-key")
-        .env("OPENAI_BASE_URL", base_url)
-        .env_remove("OPENAI_MODEL")
-        .env("NO_PROXY", "*")
-        .env("no_proxy", "*")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    configure(&mut command);
-    let mut child = command.spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(input).await.unwrap();
-    drop(stdin);
-    let mut observed = Vec::new();
-    if let Some((fragment, proceed)) = handshake {
-        let mut stdout = child.stdout.take().unwrap();
-        observed.resize(fragment.len(), 0);
-        timeout(Duration::from_secs(5), stdout.read_exact(&mut observed))
-            .await
-            .expect("agent buffered the first fragment while mock withheld the remainder")
-            .unwrap();
-        assert_eq!(observed, fragment);
-        proceed.send(()).unwrap();
-        child.stdout = Some(stdout);
-    }
-    let mut output = timeout(Duration::from_secs(10), child.wait_with_output())
-        .await
-        .expect("agent did not exit")
-        .unwrap();
-    observed.extend_from_slice(&output.stdout);
-    output.stdout = observed;
-    stop.send(()).unwrap();
-    let requests = server.await.unwrap();
-    (output, requests, cwd.0.clone())
-}
-
-fn stdout(output: &Output) -> &str {
-    std::str::from_utf8(&output.stdout).unwrap()
-}
-
-fn stderr(output: &Output) -> &str {
-    std::str::from_utf8(&output.stderr).unwrap()
-}
+use std::fs;
+use support::*;
+use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn two_turns_replay_exact_history_and_cwd_with_configured_wire_fields() {
@@ -274,6 +46,21 @@ async fn two_turns_replay_exact_history_and_cwd_with_configured_wire_fields() {
         );
         assert_eq!(request.body["model"], "mock-model");
         assert_eq!(request.body["stream"], true);
+        assert_eq!(
+            request.body["tools"],
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "bash",
+                    "description": "Run a bash command in the current directory.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"]
+                    }
+                }
+            }])
+        );
         assert_eq!(
             request.body["stream_options"],
             json!({"include_usage": true})
@@ -727,4 +514,399 @@ async fn failure_after_observed_second_turn_fragment_never_submits_queued_third_
     assert!(stderr(&output).starts_with("> > Error: "));
     assert!(stderr(&output).contains("Failed to parse Chat Completions stream chunk"));
     assert_eq!(requests.len(), 2);
+}
+
+#[tokio::test]
+async fn bash_round_replays_exact_history() {
+    // Whitespace in JSON arguments must survive decoding and history replay.
+    let arguments = "{ \"command\" : \"printf hi\" }";
+    let (output, requests, _) = run(
+        b"say hi\nnext\n/exit\n",
+        vec![
+            tool_completion(&[tool_delta(0, Some("a"), Some("bash"), arguments)]),
+            answer("Hi."),
+            answer("Next."),
+        ],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Hi.\nNext.\n");
+    assert_eq!(stderr(&output), "> $ printf hi\nExit code: 0\nhi\n> > ");
+    assert_eq!(requests.len(), 3);
+    let mut expected = requests[0].body["messages"].as_array().unwrap().clone();
+    assert_eq!(expected.len(), 2);
+    expected.push(
+        json!({"role": "assistant", "content": null, "tool_calls": [{
+            "id": "a", "type": "function", "function": {"name": "bash", "arguments": arguments}
+        }]}),
+    );
+    expected.push(json!({"role": "tool", "tool_call_id": "a", "content": "{\"output\":\"hi\",\"exit_code\":0}"}));
+    assert_eq!(requests[1].body["messages"], json!(expected));
+    expected.push(json!({"role": "assistant", "content": "Hi."}));
+    expected.push(json!({"role": "user", "content": "next"}));
+    assert_eq!(requests[2].body["messages"], json!(expected));
+    for request in &requests {
+        assert_eq!(request.body["tools"], requests[0].body["tools"]);
+        assert_eq!(request.body["stream"], true);
+        assert_eq!(
+            request.body["stream_options"],
+            json!({"include_usage": true})
+        );
+    }
+}
+
+#[tokio::test]
+async fn multiple_calls_and_rounds_execute_in_numeric_order() {
+    let (output, requests, _) = run_inspected(
+        b"do work\n/exit\n",
+        vec![
+            tool_completion(&[
+                tool_delta(7, Some("read"), Some("bash"), "{\"command\":\"cat "),
+                bash_call(0, "write", "printf first > marker"),
+                tool_delta(7, None, None, "marker\"}"),
+            ]),
+            tool_completion(&[bash_call(
+                0,
+                "append",
+                "printf second >> marker; cat marker",
+            )]),
+            answer("Done."),
+        ],
+        |_| {},
+        None,
+        |cwd| {
+            assert_eq!(
+                fs::read_to_string(cwd.join("marker")).unwrap(),
+                "firstsecond"
+            )
+        },
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Done.\n");
+    assert_eq!(requests.len(), 3);
+    let first = &requests[1].body["messages"];
+    assert_eq!(first[2]["tool_calls"][0]["id"], "write");
+    assert_eq!(first[2]["tool_calls"][1]["id"], "read");
+    assert_eq!(first[3]["tool_call_id"], "write");
+    assert_eq!(first[4]["tool_call_id"], "read");
+    assert_eq!(
+        tool_result(&requests[1], 3),
+        json!({"output": "", "exit_code": 0})
+    );
+    assert_eq!(
+        tool_result(&requests[1], 4),
+        json!({"output": "first", "exit_code": 0})
+    );
+    let last = requests[2].body["messages"].as_array().unwrap();
+    assert_eq!(&last[..5], first.as_array().unwrap());
+    assert_eq!(last[5]["tool_calls"][0]["id"], "append");
+    assert_eq!(last[6]["tool_call_id"], "append");
+    assert_eq!(
+        tool_result(&requests[2], 6),
+        json!({"output": "firstsecond", "exit_code": 0})
+    );
+    assert_eq!(last.len(), 7);
+    assert_eq!(
+        stderr(&output),
+        "> $ printf first > marker\nExit code: 0\n$ cat marker\nExit code: 0\nfirst\n$ printf second >> marker; cat marker\nExit code: 0\nfirstsecond\n> "
+    );
+}
+
+#[tokio::test]
+async fn mixed_text_and_tool_only_responses() {
+    let body = format!(
+        "{}{}{}{}{}data: [DONE]\n\n",
+        text_event("Checking 雪…"),
+        tool_delta(
+            0,
+            Some("escaped"),
+            Some("bash"),
+            "{\"command\":\"printf '%s' "
+        ),
+        tool_delta(0, None, None, "\\\"雪\\\"\"}"),
+        tool_finish(),
+        event(json!({"choices": [], "usage": {"total_tokens": 8}}))
+    );
+    let parts = body.as_bytes().chunks(1).map(|b| b.to_vec()).collect();
+    let (output, requests, _) = run(
+        b"look\n/exit\n",
+        vec![
+            Reply::Stream {
+                parts,
+                after_first: None,
+                truncated: false,
+            },
+            tool_completion(&[text_event(""), bash_call(0, "empty", "")]),
+            tool_completion(&[bash_call(0, "only", "true")]),
+            answer("雪 found"),
+        ],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Checking 雪…\n\n雪 found\n");
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[1].body["messages"][2]["content"], "Checking 雪…");
+    assert_eq!(
+        tool_result(&requests[1], 3),
+        json!({"output": "雪", "exit_code": 0})
+    );
+    assert_eq!(requests[2].body["messages"][4]["content"], "");
+    assert!(requests[3].body["messages"][6]["content"].is_null());
+}
+
+#[tokio::test]
+async fn invalid_batch_never_executes() {
+    let first = bash_call(0, "valid", "touch marker");
+    let valid_second = json!({"index": 1, "id": "second", "type": "function", "function": {
+        "name": "bash", "arguments": "{\"command\":\"touch other\"}"
+    }});
+    let mut invalid = Vec::new();
+    for field in ["index", "id", "type", "function"] {
+        let mut bad = valid_second.clone();
+        bad.as_object_mut().unwrap().remove(field);
+        invalid.push(bad);
+    }
+    for (field, value) in [
+        ("index", json!(-1)),
+        ("id", json!("valid")),
+        ("id", json!(" ")),
+        ("type", json!("other")),
+    ] {
+        let mut bad = valid_second.clone();
+        bad[field] = value;
+        invalid.push(bad);
+    }
+    for name in [Value::Null, json!(""), json!("other")] {
+        let mut bad = valid_second.clone();
+        bad["function"]["name"] = name;
+        invalid.push(bad);
+    }
+    for args in ["{", "{}", "{\"command\":7}", "[\"true\"]"] {
+        let mut bad = valid_second.clone();
+        bad["function"]["arguments"] = json!(args);
+        invalid.push(bad);
+    }
+    let mut bodies: Vec<Vec<u8>> = invalid
+        .into_iter()
+        .map(|bad| {
+            format!(
+                "{}{}{}data: [DONE]\n\n",
+                first,
+                event(json!({"choices": [{"delta": {"tool_calls": [bad]}}]})),
+                tool_finish()
+            )
+            .into_bytes()
+        })
+        .collect();
+    for metadata in [
+        json!({"index": 0, "id": "conflict"}),
+        json!({"index": 0, "type": "other"}),
+        json!({"index": 0, "function": {"name": "other"}}),
+    ] {
+        bodies.push(
+            format!(
+                "{}{}{}data: [DONE]\n\n",
+                first,
+                event(json!({"choices": [{"delta": {"tool_calls": [metadata]}}]})),
+                tool_finish()
+            )
+            .into_bytes(),
+        );
+    }
+    for tail in [
+        format!("{}data: [DONE]\n\n", finish_event()),
+        "data: [DONE]\n\n".to_owned(),
+        tool_finish(),
+        format!("{}data: malformed\n\ndata: [DONE]\n\n", tool_finish()),
+        format!("{}{}data: [DONE]\n\n", finish_event(), tool_finish()),
+    ] {
+        bodies.push(format!("{first}{tail}").into_bytes());
+    }
+    let mut invalid_sse = format!("{first}{}", tool_finish()).into_bytes();
+    invalid_sse.extend_from_slice(b"data: \xff\n\ndata: [DONE]\n\n");
+    bodies.push(invalid_sse);
+    // The finish reason alone cannot manufacture a batch, even with text present.
+    bodies.push(format!("{}data: [DONE]\n\n", tool_finish()).into_bytes());
+    for (case, body) in bodies.into_iter().enumerate() {
+        let (output, requests, _) = run_inspected(
+            b"run\nqueued\n",
+            vec![Reply::Stream {
+                parts: vec![text_event("before").into_bytes(), body],
+                after_first: None,
+                truncated: false,
+            }],
+            |_| {},
+            None,
+            |cwd| {
+                assert!(!cwd.join("marker").exists(), "case {case}");
+                assert!(!cwd.join("other").exists(), "case {case}");
+            },
+        )
+        .await;
+        assert!(!output.status.success(), "case {case}: {}", stderr(&output));
+        assert_eq!(stdout(&output), "before", "case {case}");
+        assert!(!stderr(&output).contains("$ "), "case {case}");
+        assert!(stderr(&output).contains("Error:"), "case {case}");
+        assert_eq!(requests.len(), 1, "case {case}");
+    }
+}
+
+#[tokio::test]
+async fn nonzero_exit_returns_to_model() {
+    let (output, requests, _) = run(
+        b"fail\n/exit\n",
+        vec![
+            tool_completion(&[bash_call(0, "a", "printf out; printf err >&2; exit 7")]),
+            answer("Command failed with 7."),
+        ],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Command failed with 7.\n");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_result(&requests[1], 3),
+        json!({"output": "outerr", "exit_code": 7})
+    );
+}
+
+#[tokio::test]
+async fn tool_stdin_does_not_consume_next_turn() {
+    // Exceed BufRead's prefetch so inherited child stdin would steal pending input.
+    let queued = format!("queued {}", "x".repeat(32768));
+    let input = format!("cat\n{queued}\n/exit\n");
+    let (output, requests, _) = run(
+        input.as_bytes(),
+        vec![
+            tool_completion(&[bash_call(0, "stdin", "cat")]),
+            answer("EOF."),
+            answer("Queued."),
+        ],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "EOF.\nQueued.\n");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        tool_result(&requests[1], 3),
+        json!({"output": "", "exit_code": 0})
+    );
+    assert_eq!(
+        requests[2].body["messages"][5],
+        json!({"role": "user", "content": queued})
+    );
+}
+
+#[tokio::test]
+async fn preview_is_bounded_but_result_is_complete() {
+    for (command, full, preview) in [
+        (
+            "for ((i=0;i<12;i++)); do printf '雪\\n'; done",
+            "雪\n".repeat(12),
+            "雪\n".repeat(10),
+        ),
+        (
+            "for ((i=0;i<12;i++)); do printf '雪%.0s' {1..300}; printf '\\n'; done",
+            format!("{}\n", "雪".repeat(300)).repeat(12),
+            format!(
+                "{}{}",
+                format!("{}\n", "雪".repeat(300)).repeat(6),
+                "雪".repeat(194)
+            ),
+        ),
+    ] {
+        let (output, requests, _) = run(
+            b"large\n/exit\n",
+            vec![
+                tool_completion(&[bash_call(0, "large", command)]),
+                answer("Complete."),
+            ],
+            |_| {},
+        )
+        .await;
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(stdout(&output), "Complete.\n");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            tool_result(&requests[1], 3),
+            json!({"output": full, "exit_code": 0})
+        );
+        let stderr = stderr(&output);
+        let body = stderr.split_once("Exit code: 0\n").unwrap().1;
+        let actual = body.split_once("[output preview truncated]\n").unwrap().0;
+        let expected = if preview.ends_with('\n') {
+            preview
+        } else {
+            format!("{preview}\n")
+        };
+        assert_eq!(actual, expected);
+        assert!(actual.trim_end_matches('\n').chars().count() <= 2000);
+        assert!(actual.lines().count() <= 10);
+    }
+}
+
+#[tokio::test]
+async fn failure_after_a_tool_round_stops_queued_input() {
+    for (reply, expected) in [
+        (
+            Reply::Http(503, "provider unavailable".to_owned()),
+            "Checking.\n",
+        ),
+        (
+            Reply::Http(200, format!("{}data: malformed\n\n", text_event("partial"))),
+            "Checking.\npartial",
+        ),
+    ] {
+        let (output, requests, _) = run(
+            b"work\nqueued\n",
+            vec![
+                tool_completion(&[text_event("Checking."), bash_call(0, "a", "printf hi")]),
+                reply,
+            ],
+            |_| {},
+        )
+        .await;
+        assert!(!output.status.success());
+        assert_eq!(stdout(&output), expected);
+        assert!(stderr(&output).contains("hi\nError:"));
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].body["messages"].as_array().unwrap().len(), 4);
+    }
+}
+
+#[tokio::test]
+async fn bash_does_not_inherit_api_key_but_http_remains_authorized() {
+    let (output, requests, _) = run(
+        b"check environment\n/exit\n",
+        vec![
+            tool_completion(&[bash_call(
+                0,
+                "env",
+                "if [ \"${OPENAI_API_KEY+x}\" = x ]; then printf present; else printf absent; fi",
+            )]),
+            answer("Checked."),
+        ],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        tool_result(&requests[1], 3),
+        json!({"output": "absent", "exit_code": 0})
+    );
+    assert_eq!(stdout(&output), "Checked.\n");
+    assert!(!stderr(&output).contains("dummy-key"));
+    for request in requests {
+        assert!(
+            request
+                .headers
+                .contains(&("authorization".to_owned(), "Bearer dummy-key".to_owned()))
+        );
+    }
 }
