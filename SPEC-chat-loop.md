@@ -1,14 +1,16 @@
-# Spec: Chat Loop with Step 4 Streaming — V1
+# Spec: Streaming Chat Loop with Bash Tools — V1
 
-Status: approved
+Status: implemented (Steps 3–5)
 
 ## Objective
 
-Replace the one-question CLI with a minimal line-based REPL so later turns include
-earlier messages. This implements [PLAN.md Step 3](PLAN.md#step-3-chat-loop-repl) and
-[Step 4](PLAN.md#step-4-streaming); later steps remain deferred. Success means
-launching `cargo run`, seeing text as it arrives, exchanging multiple turns, and
-quitting with `/exit` or end-of-input.
+Provide a minimal streaming, line-based REPL with conversation history and a
+sequential bash tool loop. This implements [PLAN.md Step 3](PLAN.md#step-3-chat-loop-repl),
+[Step 4](PLAN.md#step-4-streaming), and [Step 5](PLAN.md#step-5-tool-plumbing--bash).
+Success means exchanging multiple turns, running bash commands when requested by
+the model, answering from their results, and quitting with `/exit` or end-of-input.
+The [approved Step 5 delta](docs/superpowers/specs/2026-11-17-step-5-bash-design.md)
+records the design choices; Step 6 guard rails remain deferred.
 
 ## Previous behavior
 
@@ -52,12 +54,26 @@ already existed.
 
 - For each accepted line, append a user message, send the entire history to
   `{base_url}/chat/completions`, stream the first choice's content, validate
-  completion, print and flush one terminating newline, then append exactly one
-  assistant message containing the concatenated deltas.
+  completion, and append exactly one assistant message containing the accumulated
+  text and tool calls. Print and flush one terminating newline only when text was
+  present, including an explicit empty string. Tool-only replies add no blank line.
+- Assistant tool calls contain typed `id`, `type: "function"`, and
+  `function: {name, arguments}` fields. Preserve the exact accumulated arguments
+  JSON **string** in history. A tool-only assistant message has `content: null`.
+  Omit empty `tool_calls` and absent `tool_call_id` fields from ordinary messages.
+- Every request advertises exactly one tool, with no extra schema options:
+
+  ```json
+  {"type":"function","function":{"name":"bash","description":"Run a bash command in the current directory.","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}
+  ```
 - Send the configured model and Bearer authorization. Reuse one HTTP client.
   Include `"stream": true` and `"stream_options": {"include_usage": true}` in
   every request. Keep typed serde request, chunk, choice, and delta structures.
-- Send requests sequentially. Do not read the next turn while awaiting a reply.
+- Send requests sequentially. After a completed tool batch, append the assistant
+  message, execute each call in numeric index order, append exactly one `tool`
+  message per call with its original `tool_call_id` and result content, then
+  request another assistant response. Repeat until there are no calls. Do not
+  prompt or read another user line between rounds. There is no tool-round limit.
 - Write each string content delta to the locked stdout and flush immediately,
   preserving exact whitespace and Unicode. Accumulate the same fragments without
   reprinting them. Prompts and errors belong on stderr; no role labels, banners,
@@ -78,13 +94,39 @@ already existed.
 - Empty choices with non-null usage are valid. Empty choices without usage are
   errors. Usage itself is optional; do not display, persist, or calculate costs
   from it.
-- Success requires `[DONE]`, a recorded finish reason, and at least one string
-  content delta. An explicit empty string counts, prints a terminating newline,
-  and is retained as an empty assistant reply. Missing-content errors include
-  the finish reason or `unknown`.
-- Only after successful validation and the terminating newline's write/flush
-  may the complete assistant message enter history. Later requests include it
-  exactly once.
+- Accumulate `delta.tool_calls` by numeric index independently from text. Preserve
+  sparse numeric order and concatenate argument fragments without parsing partial
+  JSON. Initial metadata supplies id, type and function name. Repeated identical
+  metadata is accepted; conflicts or incomplete metadata are fatal.
+- Success requires `[DONE]` and a recorded finish reason. A nonempty valid tool
+  batch requires `finish_reason: "tool_calls"`; that reason requires a nonempty
+  batch. Otherwise at least one string content delta is required. An explicit
+  empty string counts. Missing-content errors include the finish reason or `unknown`.
+- Validate the entire batch before running anything: ids are nonblank and unique,
+  type is `function`, name is `bash`, and arguments deserialize to a typed object
+  with a string `command`. Invalid later calls prevent earlier calls from running.
+- Only after successful validation and any terminating newline's write/flush may
+  the complete assistant message enter history. Later requests include it once.
+
+### Bash execution and diagnostics
+
+- Run `tokio::process::Command::new("bash").arg("-c").arg(command)` with the command
+  as one argument, null stdin, and explicit startup cwd. Each call is a fresh shell;
+  `cd` and shell variables do not persist. REPL input stays reserved for the agent.
+  Remove `OPENAI_API_KEY` from the child environment; the parent retains it for HTTP
+  authorization so command output cannot expose it through environment inspection.
+- Merge stdout and stderr into one pipe at launch. Drain it concurrently with the
+  child to avoid pipe-buffer deadlocks, capture termination status, and decode the
+  full output as UTF-8 lossily.
+- Tool content is a JSON string encoding `{"output":"...","exit_code":0}`.
+  Signal termination uses `exit_code: null` and an additional nonempty
+  `termination` description. Nonzero exit codes are completed tool results and
+  the model continues. Spawn, wait and capture failures are fatal contextual errors.
+- Before spawning, write and flush `$ <command>` to stderr. After completion,
+  write status and a preview capped at 10 lines and 2,000 Unicode scalar values.
+  Add `[output preview truncated]` if shortened. The model receives full output;
+  the preview limits affect stderr only. All diagnostic write/flush failures are
+  fatal. Only assistant text goes to stdout.
 
 ### Failure handling
 
@@ -93,7 +135,8 @@ already existed.
 - Preserve HTTP status and response body in errors for unsuccessful responses.
 - Transport/SSE decoding errors, malformed JSON, invalid chunk shapes, empty
   choices without usage, premature EOF without `[DONE]`, missing finish reason,
-  and missing string content are fatal. A finish reason without `[DONE]` is
+  missing required string content, invalid tool batches, and calls/finish-reason
+  mismatches are fatal. A finish reason without `[DONE]` is
   insufficient, as is `[DONE]` without a finish reason.
 - A failed stream leaves already flushed text visible without a success newline.
   Do not erase it, replay the request, fabricate completion, append partial
@@ -107,14 +150,17 @@ Rust edition 2024, one binary crate. Use `anyhow`, `reqwest` (JSON, rustls,
 and stream), `serde` (derive), `serde_json`, `tokio` (full), `futures`, and
 `eventsource-stream`. Resolved versions remain governed by tracked `Cargo.lock`.
 
-- `src/main.rs`: configuration, wire types, HTTP handling, and the small REPL;
-  keep production code here until it exceeds roughly 300 lines.
+- `src/main.rs`: configuration, startup prompt, REPL and sequential tool loop.
+- `src/types.rs`: typed messages, tool calls, bash arguments and completed replies.
+- `src/openai.rs`: typed wire/schema structures, HTTP/SSE handling, indexed
+  accumulation and complete-batch validation.
+- `src/bash.rs`: shell execution, merged capture, status serialization and previews.
 - `tests/chat_loop.rs`: subprocess integration tests using stdin/stdout/stderr
   and a local HTTP mock, including chunked SSE fixtures and a timeout-bounded
-  stdout handshake proving incremental flushing.
+  stdout handshake proving incremental flushing. Shared fixtures and the
+  throwaway-directory/mock-server harness live in `tests/support/mod.rs`.
 - `SPEC-chat-loop.md`: this feature's requirements.
 - `PLAN.md`: implementation progress; check each step only after verification.
-- `AGENTS.md`: update its running example to show `cargo run`.
 - `Cargo.lock`: stays tracked; `/target` stays ignored.
 
 Use rustfmt, snake_case functions and variables, PascalCase types, typed serde
@@ -125,6 +171,10 @@ messages, and `anyhow` context for fallible operations. Preserve the wire shape:
 struct ChatMessage {
     role: String,
     content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<ToolCall>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
 }
 ```
 
@@ -146,7 +196,7 @@ framework and subprocess integration tests. No model inference or coverage
 percentage target is required. Cover these observable contracts:
 
 1. No-argument startup accepts stdin; supplied arguments fail without HTTP calls.
-2. Two successful turns make exactly two requests with role sequences
+2. Two successful text-only turns make exactly two requests with role sequences
    `[system, user]` and `[system, user, assistant, user]`. Assert exact prior
    contents, configured model, path, and dummy authorization header.
 3. The system message occurs once, contains the subprocess cwd, and stays
@@ -166,18 +216,32 @@ percentage target is required. Cover these observable contracts:
    behavior, optional usage, multiline data, comments, LF/CRLF, and JSON/Unicode
    split across network writes; include multiple events in one write. Check
    stdout write/flush failures stop the next turn.
-10. Formatting, locked build, and locked tests pass. Report whether verification
-    used mocks or a live provider.
+10. Verify the exact single bash schema; fragmented/interleaved calls, escaped
+    arguments and numeric order; null/tool-only and mixed text messages; exact
+    history across multiple tool rounds and user turns; and whole-batch rejection
+    before execution for invalid calls or incomplete streams.
+11. Verify merged output, nonzero/signal status, lossy UTF-8, fresh cwd/shell state,
+    null stdin with queued input, output larger than a pipe buffer, diagnostic
+    failures, and both preview caps without shortening model-visible output.
+12. Formatting, locked build, and locked tests pass. Smoke-test a folder-listing
+    tool round via `cargo run` against a local mock in a throwaway directory.
+    Report whether verification used mocks or a live provider.
+
+Verified on 2026-11-18 with 9 unit and 25 subprocess integration tests, the three
+required Cargo checks, and the folder-listing smoke scenario. All HTTP checks
+used local mocks and dummy credentials; no live provider calls.
 
 ## Boundaries
 
-- Always stay within Steps 3–4, use contextual errors, preserve stdout/stderr
+- Always stay within Steps 3–5, use contextual errors, preserve stdout/stderr
   separation, run required checks, and update progress only after verification.
 - Ask first before expanding beyond this spec, adding dependencies, or changing CI.
 - Never print or commit API keys, make paid calls for automated validation,
   remove failing tests to pass checks, or alter unrelated user changes.
 
-Tool execution and streaming tool calls are deferred to Phase 2. Saved
+Step 6 owns timeouts, process-group cleanup, truncation of model-visible output,
+`Error (exit code N):` prefixes, and malformed-argument recovery. Invalid arguments
+and unknown tools remain fatal in Step 5. Live tool-output streaming, saved
 sessions, resume, compaction, context limits, multiline editing, input history,
 TUI, special Ctrl-C handling, retries, recovery, extra commands, and print mode
 are out of scope. Retain normal process signal behavior. Loading project
@@ -187,5 +251,5 @@ this step includes only the cwd in the tiny system prompt.
 ## Open questions
 
 None blocking. Approval includes the inherited input/system-prompt behavior,
-finish reason plus `[DONE]`, optional usage, missing-content policy, and fail-fast
-partial-output behavior above.
+finish reason plus `[DONE]`, optional usage, text/tool completion policy, bash
+result representation and previews, and fail-fast partial-output behavior above.
