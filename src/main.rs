@@ -7,9 +7,11 @@ use anyhow::{Context, Result, ensure};
 
 mod bash;
 mod openai;
+mod read;
+mod tools;
 mod types;
 
-use types::{ChatMessage, parse_bash_args};
+use types::ChatMessage;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MODEL: &str = "gpt-4.1";
@@ -80,27 +82,19 @@ async fn main() -> Result<()> {
         loop {
             let message =
                 openai::chat(&client, &url, &api_key, &model, &history, &mut stdout).await?;
-            let calls = message
-                .tool_calls
-                .iter()
-                .map(|call| {
-                    Ok((
-                        call.id.clone(),
-                        parse_bash_args(&call.function.arguments)?.command,
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            // Only completed streams with successfully flushed output enter history.
-            history.push(message);
-            if calls.is_empty() {
+            if message.tool_calls.is_empty() {
+                history.push(message);
                 break;
             }
-            for (id, command) in calls {
-                let result = bash::run(&command, &cwd, &mut stderr)
+            let mut results = Vec::with_capacity(message.tool_calls.len());
+            for call in &message.tool_calls {
+                let result = tools::execute(call, &cwd, &mut stderr)
                     .await
-                    .with_context(|| format!("Failed to execute tool call {id}"))?;
-                history.push(ChatMessage::tool(id, result));
+                    .with_context(|| format!("Failed to execute tool call {}", call.id))?;
+                results.push(ChatMessage::tool(call.id.clone(), result));
             }
+            history.push(message);
+            history.extend(results);
         }
     }
 

@@ -123,6 +123,12 @@ guardrails and recoverable argument errors remain deferred.
 
 **Done when:** the model reads a file with `read` instead of `cat`.
 
+Implementation added per [the Step 7 plan](plans/2026-11-22-step-7-read-tool.md),
+including reader unit tests and subprocess integration tests using local HTTP
+mocks and throwaway directories. Verification is pending because this environment
+has no Rust toolchain; checklist items remain unchecked until validation passes.
+Step 6 Bash guardrails remain deferred.
+
 ### Step 8: `write` and `edit` tools
 - [ ] `write { path, content }` creates parent directories and overwrites the file.
 - [ ] `edit { path, old_text, new_text }`, exact replacement only (like pi):
