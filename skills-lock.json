@@ -8,6 +8,13 @@
       "skillPath": "skills/code-review-and-quality/SKILL.md",
       "computedHash": "55dfc44b9cce8f74673005d566a1af57e9c95694f1c89b964a9d12b7ae76930c"
     },
+    "explain-changes": {
+      "source": "ernesto27/skills",
+      "commit": "b40930b2bf523a0ccdc1327528121d0e63deea7c",
+      "sourceType": "github",
+      "skillPath": "skills/explain-changes/SKILL.md",
+      "computedHash": "ff882c07681a52e0c8629b52904c97665cb3aff33449166fd0cf8dc2b8083877"
+    },
     "interview-me": {
       "source": "addyosmani/agent-skills",
       "commit": "39b723ceebf81474d0557c1fecd01eddab585563",
@@ -15,12 +22,26 @@
       "skillPath": "skills/interview-me/SKILL.md",
       "computedHash": "68615337944c1d56cd9db6b934e247ff1d67600dd9db3d41cc9bf7236b9d986c"
     },
+    "plan-from-spec": {
+      "source": "ernesto27/skills",
+      "commit": "b40930b2bf523a0ccdc1327528121d0e63deea7c",
+      "sourceType": "github",
+      "skillPath": "skills/plan-from-spec/SKILL.md",
+      "computedHash": "68393e0fd6c623769f960f7009f8177f8032da30d2f267eb009bbd2ac8ed1051"
+    },
     "spec-driven-development": {
       "source": "addyosmani/agent-skills",
       "commit": "39b723ceebf81474d0557c1fecd01eddab585563",
       "sourceType": "github",
       "skillPath": "skills/spec-driven-development/SKILL.md",
       "computedHash": "504a76654a492c1ec1fa0e1c59387b8b2969fe2319191cd298c4e3482cf2582a"
+    },
+    "tutorial-master": {
+      "source": "ernesto27/skills",
+      "commit": "b40930b2bf523a0ccdc1327528121d0e63deea7c",
+      "sourceType": "github",
+      "skillPath": "skills/tutorial-master/SKILL.md",
+      "computedHash": "bdf0e747649f7c24be348a6cbe99eba7e4ccb02ce008b2da6d9078df724220a5"
     }
   }
 }
