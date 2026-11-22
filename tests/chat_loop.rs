@@ -802,6 +802,12 @@ fn bash_call(index: usize, id: &str, command: &str) -> Value {
     }})
 }
 
+fn read_call(index: usize, id: &str, arguments: &str) -> Value {
+    json!({"index":index,"id":id,"type":"function","function":{
+        "name":"read","arguments":arguments
+    }})
+}
+
 fn tool_reply(calls: Vec<Value>) -> Reply {
     let body = format!(
         "{}{}data: [DONE]\n\n",
@@ -854,6 +860,20 @@ async fn bash_results_nonzero_exits_and_full_history_reach_model() {
                         "required":["command"], "additionalProperties":false
                     }
                 }
+            }, {
+                "type":"function", "function":{
+                    "name":"read",
+                    "description":"Read a UTF-8 text file by line number. Prefer this over cat for reading files.",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{
+                            "path":{"type":"string","minLength":1},
+                            "offset":{"type":"integer","minimum":1,"default":1},
+                            "limit":{"type":"integer","minimum":1,"maximum":2000,"default":2000}
+                        },
+                        "required":["path"], "additionalProperties":false
+                    }
+                }
             }])
         );
         assert_eq!(request.body["stream"], true);
@@ -894,7 +914,7 @@ async fn invalid_batch_stops_before_any_command_or_next_input() {
         json!({"index":1,"id":"bad","type":"function",
             "function":{"name":"bash","arguments":"{"}}),
         json!({"index":1,"id":"bad","type":"function",
-            "function":{"name":"read","arguments":"{\"command\":\"ls\"}"}}),
+            "function":{"name":"unknown","arguments":"{\"command\":\"ls\"}"}}),
         json!({"index":1,"id":"bad","type":"other",
             "function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}),
     ] {
@@ -912,6 +932,108 @@ async fn invalid_batch_stops_before_any_command_or_next_input() {
         assert!(!stderr(&output).contains("$ printf MUST_NOT_RUN"));
         assert_eq!(stdout(&output), "");
     }
+}
+
+#[tokio::test]
+async fn read_pages_and_bash_results_reach_the_model_in_order() {
+    let fixture = TestDir::new();
+    let work = fixture.0.join("work");
+    fs::create_dir(&work).unwrap();
+    fs::write(fixture.0.join("sample.txt"), "one\r\ntwo\nthree").unwrap();
+    let absolute = json!({"path":fixture.0.join("sample.txt"),"offset":2}).to_string();
+    let (output, requests, _) = run(
+        b"read the sample\n/exit\n",
+        vec![
+            tool_reply(vec![
+                bash_call(0, "bash", "printf ready"),
+                read_call(1, "first", r#"{"path":"../sample.txt","limit":1}"#),
+            ]),
+            tool_reply(vec![read_call(0, "second", &absolute)]),
+            answer("The file contains one, two, three."),
+        ],
+        |command| {
+            command.current_dir(&work);
+        },
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "The file contains one, two, three.\n");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[1].body["messages"][2]["tool_calls"][1]["function"]["name"],
+        "read"
+    );
+    assert_eq!(
+        requests[1].body["messages"][3],
+        json!({
+            "role":"tool","tool_call_id":"bash","content":"Exit code: 0\nready"
+        })
+    );
+    assert_eq!(
+        requests[1].body["messages"][4],
+        json!({
+            "role":"tool","tool_call_id":"first",
+            "content":"     1\tone\n[showing lines 1-1 of 3, use offset=2 to read more]\n"
+        })
+    );
+    assert_eq!(
+        requests[2].body["messages"][6],
+        json!({
+            "role":"tool","tool_call_id":"second","content":"     2\ttwo\n     3\tthree\n"
+        })
+    );
+    assert!(stderr(&output).contains("read \"../sample.txt\""));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_failures_return_tool_results_and_retry_can_follow_a_symlink() {
+    let fixture = TestDir::new();
+    fs::write(fixture.0.join("data.bin"), b"text\0bytes").unwrap();
+    fs::write(fixture.0.join("ok.txt"), "recovered\n").unwrap();
+    std::os::unix::fs::symlink("ok.txt", fixture.0.join("link.txt")).unwrap();
+    let (output, requests, _) = run(
+        b"read a file\n/exit\n",
+        vec![
+            tool_reply(vec![
+                read_call(0, "args", "{"),
+                read_call(1, "missing", r#"{"path":"missing"}"#),
+                read_call(2, "dir", r#"{"path":"."}"#),
+                read_call(3, "binary", r#"{"path":"data.bin"}"#),
+            ]),
+            tool_reply(vec![read_call(0, "retry", r#"{"path":"link.txt"}"#)]),
+            answer("recovered"),
+        ],
+        |command| {
+            command.current_dir(&fixture.0);
+        },
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "recovered\n");
+    assert_eq!(requests.len(), 3);
+    for (index, (id, reason)) in [
+        ("args", "read arguments"),
+        ("missing", "file not found"),
+        ("dir", "path is a directory"),
+        ("binary", "binary file"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let result = &requests[1].body["messages"][index + 3];
+        assert_eq!(result["role"], "tool");
+        assert_eq!(result["tool_call_id"], id);
+        let content = result["content"].as_str().unwrap();
+        assert!(content.starts_with("Error: read"), "{content}");
+        assert!(content.contains(reason), "{content}");
+    }
+    assert_eq!(
+        requests[2].body["messages"][8],
+        json!({
+            "role":"tool","tool_call_id":"retry","content":"     1\trecovered\n"
+        })
+    );
 }
 
 #[tokio::test]

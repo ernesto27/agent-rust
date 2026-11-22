@@ -115,13 +115,17 @@ guardrails and recoverable argument errors remain deferred.
 **Done when:** `sleep 999` times out cleanly and `cat` on a huge file doesn't flood the context.
 
 ### Step 7: `read` tool
-- [ ] Parameters: `{ path, offset?, limit? }`. Relative paths are resolved against the cwd.
-- [ ] Output is line-numbered (`{n:>6}\t{line}`), 2000 lines by default, and each line is cut at 2000 chars.
-- [ ] Tell the model when there is more: `[showing lines 1-2000 of 5400, use offset to read more]`.
-- [ ] Clear errors for a missing file, a directory or a binary file.
-- [ ] Move the tool definitions into a list, `Vec<ToolDef>`, and dispatch on `function.name`.
+- [x] Parameters: `{ path, offset?, limit? }`. Relative paths are resolved against the cwd.
+- [x] Output is line-numbered (`{n:>6}\t{line}`), 2000 lines by default, and each line is cut at 2000 chars.
+- [x] Tell the model when there is more: `[showing lines 1-2000 of 5400, use offset to read more]`.
+- [x] Clear errors for a missing file, a directory or a binary file.
+- [x] Move the tool definitions into a list, `Vec<ToolDef>`, and dispatch on `function.name`.
 
 **Done when:** the model reads a file with `read` instead of `cat`.
+
+Implemented per [the Step 7 plan](plans/2026-11-22-step-7-read-tool.md).
+Verified with reader unit tests and subprocess integration tests using local
+HTTP mocks and throwaway directories. Step 6 Bash guardrails remain deferred.
 
 ### Step 8: `write` and `edit` tools
 - [ ] `write { path, content }` creates parent directories and overwrites the file.

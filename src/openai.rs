@@ -7,8 +7,9 @@ use anyhow::{Context, Result, ensure};
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
+use crate::tools::{self, Tool, ToolDef};
 use crate::types::{ChatMessage, FunctionCall, ToolCall, parse_bash_args};
 
 #[derive(Serialize)]
@@ -23,36 +24,6 @@ struct ChatRequest<'a> {
 #[derive(Serialize)]
 struct StreamOptions {
     include_usage: bool,
-}
-
-#[derive(Serialize)]
-struct ToolDef {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    function: FunctionDef,
-}
-
-#[derive(Serialize)]
-struct FunctionDef {
-    name: &'static str,
-    description: &'static str,
-    parameters: Value,
-}
-
-fn bash_tools() -> Vec<ToolDef> {
-    vec![ToolDef {
-        kind: "function",
-        function: FunctionDef {
-            name: "bash",
-            description: "Run a bash command in the current directory.",
-            parameters: json!({
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-        },
-    }]
 }
 
 #[derive(Deserialize)]
@@ -132,8 +103,10 @@ fn finish_calls(calls: BTreeMap<usize, PendingCall>) -> Result<Vec<ToolCall>> {
         let kind = call.kind.context("Tool call missing type")?;
         ensure!(kind == "function", "Unsupported tool-call type: {kind}");
         let name = call.name.context("Tool call missing function name")?;
-        ensure!(name == "bash", "Unknown tool: {name}");
-        parse_bash_args(&call.arguments).with_context(|| format!("Invalid tool call {id}"))?;
+        let tool = Tool::from_name(&name).with_context(|| format!("Unknown tool: {name}"))?;
+        if let Tool::Bash = tool {
+            parse_bash_args(&call.arguments).with_context(|| format!("Invalid tool call {id}"))?;
+        }
         complete.push(ToolCall {
             id,
             kind,
@@ -161,7 +134,7 @@ pub async fn chat(
         stream_options: StreamOptions {
             include_usage: true,
         },
-        tools: bash_tools(),
+        tools: tools::definitions(),
     };
 
     let response = client
@@ -262,6 +235,7 @@ pub async fn chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn add(calls: &mut BTreeMap<usize, PendingCall>, value: Value) {
         accumulate(calls, serde_json::from_value(value).unwrap()).unwrap();
@@ -317,7 +291,7 @@ mod tests {
             json!({"index":0,"id":"a","type":"other",
                 "function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}),
             json!({"index":0,"id":"a","type":"function",
-                "function":{"name":"read","arguments":"{\"command\":\"ls\"}"}}),
+                "function":{"name":"unknown","arguments":"{\"command\":\"ls\"}"}}),
             json!({"index":0,"id":"a","type":"function",
                 "function":{"name":"bash","arguments":"{"}}),
         ] {
