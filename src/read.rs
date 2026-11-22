@@ -66,31 +66,76 @@ pub fn run(args: &ReadArgs, cwd: &Path) -> Result<String> {
 }
 
 fn format_page(mut reader: impl BufRead, offset: usize, limit: usize) -> Result<String> {
-    let mut bytes = Vec::new();
     let mut output = String::new();
+    // Bytes awaiting UTF-8 validation: at most one buffered chunk plus an
+    // incomplete multi-byte sequence carried over from the previous chunk.
+    let mut pending = Vec::new();
+    // First MAX_LINE_CHARS + 1 characters of the current page line; the extra
+    // character lets a CR before LF be stripped before truncating.
+    let mut line = String::new();
+    let mut chars = 0;
+    let mut ends_with_cr = false;
+    let mut in_line = false;
+    let mut on_page = false;
     let mut total = 0;
     let mut shown = 0;
-    while reader
-        .read_until(b'\n', &mut bytes)
-        .context("failed to read file")?
-        != 0
-    {
-        total += 1;
-        ensure!(!bytes.contains(&0), "binary file (contains NUL bytes)");
-        let line = std::str::from_utf8(&bytes).context("binary file (invalid UTF-8)")?;
-        if total >= offset && shown < limit {
-            let line = line
-                .strip_suffix("\r\n")
-                .or_else(|| line.strip_suffix('\n'))
-                .unwrap_or(line);
-            let end = line
-                .char_indices()
-                .nth(MAX_LINE_CHARS)
-                .map_or(line.len(), |(index, _)| index);
-            writeln!(output, "{total:>6}\t{}", &line[..end]).unwrap();
-            shown += 1;
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error).context("failed to read file"),
+        };
+        if chunk.is_empty() {
+            break;
         }
-        bytes.clear();
+        let newline = chunk.iter().position(|&byte| byte == b'\n');
+        let len = newline.map_or(chunk.len(), |index| index + 1);
+        ensure!(
+            !chunk[..len].contains(&0),
+            "binary file (contains NUL bytes)"
+        );
+        pending.extend_from_slice(&chunk[..len]);
+        reader.consume(len);
+
+        let text = match std::str::from_utf8(&pending) {
+            Ok(text) => text,
+            Err(error) if error.error_len().is_none() => {
+                std::str::from_utf8(&pending[..error.valid_up_to()]).unwrap()
+            }
+            Err(_) => bail!("binary file (invalid UTF-8)"),
+        };
+        let validated = text.len();
+        if !in_line {
+            in_line = true;
+            total += 1;
+            on_page = total >= offset && shown < limit;
+        }
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        if !text.is_empty() {
+            ends_with_cr = text.ends_with('\r');
+        }
+        if on_page {
+            let room = (MAX_LINE_CHARS + 1).saturating_sub(chars);
+            line.extend(text.chars().take(room));
+            chars += text.chars().count();
+        }
+        pending.drain(..validated);
+
+        if newline.is_some() {
+            if on_page {
+                push_line(&mut output, total, &line, chars - usize::from(ends_with_cr));
+                shown += 1;
+            }
+            line.clear();
+            chars = 0;
+            ends_with_cr = false;
+            in_line = false;
+        }
+    }
+    ensure!(pending.is_empty(), "binary file (invalid UTF-8)");
+    if in_line && on_page {
+        push_line(&mut output, total, &line, chars);
+        shown += 1;
     }
 
     if total == 0 {
@@ -113,6 +158,16 @@ fn format_page(mut reader: impl BufRead, offset: usize, limit: usize) -> Result<
         }
     }
     Ok(output)
+}
+
+/// Writes a numbered line using the first `chars` characters of `line`,
+/// capped at MAX_LINE_CHARS.
+fn push_line(output: &mut String, number: usize, line: &str, chars: usize) {
+    let end = line
+        .char_indices()
+        .nth(chars.min(MAX_LINE_CHARS))
+        .map_or(line.len(), |(index, _)| index);
+    writeln!(output, "{number:>6}\t{}", &line[..end]).unwrap();
 }
 
 #[cfg(test)]
@@ -176,5 +231,128 @@ mod tests {
         );
         assert!(format_page(&b"visible\n\xff"[..], 1, 1).is_err());
         assert!(format_page(&b"visible\n\0"[..], 1, 1).is_err());
+    }
+
+    /// The pre-chunking implementation, used as an oracle for valid input.
+    fn whole_line_reference(input: &str, offset: usize, limit: usize) -> String {
+        let mut output = String::new();
+        let lines: Vec<&str> = input.split_inclusive('\n').collect();
+        for (index, line) in lines.iter().enumerate().skip(offset - 1).take(limit) {
+            let line = line
+                .strip_suffix("\r\n")
+                .or_else(|| line.strip_suffix('\n'))
+                .unwrap_or(line);
+            let text: String = line.chars().take(MAX_LINE_CHARS).collect();
+            writeln!(output, "{:>6}\t{text}", index + 1).unwrap();
+        }
+        let total = lines.len();
+        let shown = total.saturating_sub(offset - 1).min(limit);
+        if total == 0 {
+            output.push_str("[empty file]\n");
+        } else if shown == 0 {
+            writeln!(
+                output,
+                "[no lines at offset {offset}; file has {total} lines]"
+            )
+            .unwrap();
+        } else if offset + shown - 1 < total {
+            let last = offset + shown - 1;
+            writeln!(
+                output,
+                "[showing lines {offset}-{last} of {total}, use offset={} to read more]",
+                last + 1
+            )
+            .unwrap();
+        }
+        output
+    }
+
+    fn chunked(input: &[u8], capacity: usize, offset: usize, limit: usize) -> Result<String> {
+        format_page(BufReader::with_capacity(capacity, input), offset, limit)
+    }
+
+    #[test]
+    fn small_chunks_match_whole_line_semantics() {
+        let cap = MAX_LINE_CHARS;
+        let inputs = [
+            String::new(),
+            "\n".into(),
+            "\r\n".into(),
+            "\r".into(),
+            "a\rb\r\n\r\rc\r".into(),
+            "one\r\n\nthree".into(),
+            "é🙂ü\r\nx\n€".into(),
+            format!("{}\r\n", "a".repeat(cap)),
+            format!("{}\r\n", "a".repeat(cap - 1)),
+            format!("{}\r\r\n", "a".repeat(cap - 1)),
+            format!("{}\rb\n", "a".repeat(cap)),
+            format!("{}\r", "a".repeat(cap)),
+            format!("{}\n{}", "🙂".repeat(cap + 3), "é".repeat(cap + 1)),
+        ];
+        for input in &inputs {
+            for (offset, limit) in [(1, 2_000), (1, 1), (2, 1), (2, 5), (9, 1)] {
+                let expected = whole_line_reference(input, offset, limit);
+                for capacity in 1..=7 {
+                    let actual = chunked(input.as_bytes(), capacity, offset, limit).unwrap();
+                    assert_eq!(actual, expected, "{input:?} {offset} {limit} {capacity}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn small_chunks_accept_split_utf8_and_crlf() {
+        // Four-byte characters straddle every boundary of a 3-byte buffer.
+        let input = "🙂🙂\r\n🙂";
+        assert_eq!(
+            chunked(input.as_bytes(), 3, 1, 2_000).unwrap(),
+            "     1\t🙂🙂\n     2\t🙂\n"
+        );
+        // CR ends one chunk and LF starts the next.
+        assert_eq!(
+            chunked(b"abc\r\nd", 4, 1, 1).unwrap(),
+            "     1\tabc\n[showing lines 1-1 of 2, use offset=2 to read more]\n"
+        );
+    }
+
+    #[test]
+    fn long_line_is_truncated_to_exactly_the_character_cap() {
+        let input = format!("{}tail\n", "é".repeat(MAX_LINE_CHARS));
+        let output = chunked(input.as_bytes(), 4, 1, 1).unwrap();
+        let text = output
+            .strip_prefix("     1\t")
+            .unwrap()
+            .strip_suffix('\n')
+            .unwrap();
+        assert_eq!(text.chars().count(), MAX_LINE_CHARS);
+        assert!(text.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn binary_bytes_far_past_the_line_cap_are_rejected() {
+        let mut input = "a".repeat(MAX_LINE_CHARS * 3).into_bytes();
+        input.push(0xff);
+        let error = chunked(&input, 4, 1, 1).unwrap_err();
+        assert_eq!(error.to_string(), "binary file (invalid UTF-8)");
+
+        input.pop();
+        input.extend_from_slice(b"\0rest\n");
+        let error = chunked(&input, 4, 1, 1).unwrap_err();
+        assert_eq!(error.to_string(), "binary file (contains NUL bytes)");
+
+        // A multi-byte sequence truncated by EOF or by a newline is invalid.
+        for input in [&b"ok\xf0\x9f\x99"[..], b"ok\xf0\x9f\n"] {
+            let error = chunked(input, 4, 1, 1).unwrap_err();
+            assert_eq!(error.to_string(), "binary file (invalid UTF-8)");
+        }
+    }
+
+    #[test]
+    fn newline_free_binary_input_is_rejected_without_buffering_it() {
+        use std::io::Read as _;
+        // 64 GiB of NUL bytes would abort the process if buffered as one line.
+        let zeros = std::io::repeat(0).take(64 << 30);
+        let error = format_page(BufReader::new(zeros), 1, 1).unwrap_err();
+        assert_eq!(error.to_string(), "binary file (contains NUL bytes)");
     }
 }
