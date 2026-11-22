@@ -177,7 +177,10 @@ percentage target is required. Cover these observable contracts:
 - Never print or commit API keys, make paid calls for automated validation,
   remove failing tests to pass checks, or alter unrelated user changes.
 
-Tool execution and streaming tool calls are deferred to Phase 2. Saved
+This document describes the Steps 3–4 baseline. Step 5 extends it with tool
+execution and streamed tool calls as specified in
+[the Step 5 plan](plans/2026-11-22-step-5-bash-agent-loop.md); its changed completion
+and history rules supersede this document only for tool-bearing responses. Saved
 sessions, resume, compaction, context limits, multiline editing, input history,
 TUI, special Ctrl-C handling, retries, recovery, extra commands, and print mode
 are out of scope. Retain normal process signal behavior. Loading project
