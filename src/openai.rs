@@ -70,8 +70,8 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatDelta {
     content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<ToolDelta>,
+    // Some compatible providers send `"tool_calls": null` with ordinary text.
+    tool_calls: Option<Vec<ToolDelta>>,
 }
 
 #[derive(Deserialize)]
@@ -215,7 +215,7 @@ pub async fn chat(
             content.push_str(&fragment);
             saw_content = true;
         }
-        for delta in choice.delta.tool_calls {
+        for delta in choice.delta.tool_calls.into_iter().flatten() {
             accumulate(&mut calls, delta)?;
         }
         if finish_reason.is_none() {
@@ -273,6 +273,19 @@ mod tests {
     }
 
     #[test]
+    fn null_or_missing_tool_calls_parse_as_empty() {
+        for chunk in [
+            json!({"choices":[{"delta":{"content":"hi","tool_calls":null}}]}),
+            json!({"choices":[{"delta":{"content":"hi"}}]}),
+        ] {
+            let chunk: ChatChunk = serde_json::from_value(chunk).unwrap();
+            let delta = &chunk.choices[0].delta;
+            assert_eq!(delta.content.as_deref(), Some("hi"));
+            assert!(delta.tool_calls.iter().flatten().next().is_none());
+        }
+    }
+
+    #[test]
     fn interleaved_fragments_are_sorted_and_arguments_preserved() {
         let mut calls = BTreeMap::new();
         add(&mut calls, complete(1, "b"));
@@ -302,9 +315,9 @@ mod tests {
             json!({"index":0,"id":"a","type":"function","function":{
                 "arguments":"{\"command\":\"ls\"}"}}),
             json!({"index":0,"id":"a","type":"other",
-                "function":{"name":"bash","arguments":"{}"}}),
+                "function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}),
             json!({"index":0,"id":"a","type":"function",
-                "function":{"name":"read","arguments":"{}"}}),
+                "function":{"name":"read","arguments":"{\"command\":\"ls\"}"}}),
             json!({"index":0,"id":"a","type":"function",
                 "function":{"name":"bash","arguments":"{"}}),
         ] {

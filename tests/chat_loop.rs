@@ -123,10 +123,33 @@ async fn run_with_handshake(
     configure: impl FnOnce(&mut Command),
     handshake: Option<(&[u8], oneshot::Sender<()>)>,
 ) -> (Output, Vec<Request>, PathBuf) {
+    run_full(input, None, replies, configure, handshake).await
+}
+
+/// Like `run`, but keeps stdin open and writes `deferred` only after the mock
+/// has received the first request, so the REPL cannot have buffered it.
+async fn run_with_deferred_input(
+    input: &[u8],
+    deferred: &[u8],
+    replies: Vec<Reply>,
+    configure: impl FnOnce(&mut Command),
+) -> (Output, Vec<Request>, PathBuf) {
+    run_full(input, Some(deferred), replies, configure, None).await
+}
+
+async fn run_full(
+    input: &[u8],
+    deferred: Option<&[u8]>,
+    replies: Vec<Reply>,
+    configure: impl FnOnce(&mut Command),
+    handshake: Option<(&[u8], oneshot::Sender<()>)>,
+) -> (Output, Vec<Request>, PathBuf) {
     let cwd = TestDir::new();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1///", listener.local_addr().unwrap());
     let (stop, mut stopped) = oneshot::channel();
+    let (first_request, first_received) = oneshot::channel();
+    let mut first_request = Some(first_request);
     let server = tokio::spawn(async move {
         let mut replies: VecDeque<_> = replies.into();
         let mut requests = Vec::new();
@@ -141,6 +164,9 @@ async fn run_with_handshake(
                     .await
                     .expect("client did not finish sending its request"),
             );
+            if let Some(notify) = first_request.take() {
+                let _ = notify.send(());
+            }
             match replies
                 .pop_front()
                 .unwrap_or(Reply::Http(500, "unexpected extra request".to_owned()))
@@ -160,14 +186,22 @@ async fn run_with_handshake(
                     truncated,
                 } => {
                     stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+                    let last = parts.len().saturating_sub(1);
                     for (index, part) in parts.iter().enumerate() {
                         stream
                             .write_all(format!("{:x}\r\n", part.len()).as_bytes())
                             .await
                             .unwrap();
                         stream.write_all(part).await.unwrap();
-                        stream.write_all(b"\r\n").await.unwrap();
                         stream.flush().await.unwrap();
+                        // The client may legitimately close once the final
+                        // payload ends the stream ([DONE] or a fatal chunk),
+                        // so framing after it is best-effort.
+                        let framing = stream.write_all(b"\r\n").await;
+                        if index < last {
+                            framing.unwrap();
+                            stream.flush().await.unwrap();
+                        }
                         if index == 0
                             && let Some(proceed) = after_first.take()
                         {
@@ -178,7 +212,8 @@ async fn run_with_handshake(
                         }
                     }
                     if !truncated {
-                        stream.write_all(b"0\r\n\r\n").await.unwrap();
+                        let _ = stream.write_all(b"0\r\n\r\n").await;
+                        let _ = stream.flush().await;
                     }
                 }
             }
@@ -201,6 +236,16 @@ async fn run_with_handshake(
     let mut child = command.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(input).await.unwrap();
+    if let Some(deferred) = deferred {
+        stdin.flush().await.unwrap();
+        timeout(Duration::from_secs(5), first_received)
+            .await
+            .expect("agent did not send its first request")
+            .unwrap();
+        // The REPL is now inside the agent loop, so these bytes stay in the
+        // pipe where only a child inheriting stdin could consume them.
+        stdin.write_all(deferred).await.unwrap();
+    }
     drop(stdin);
     let mut observed = Vec::new();
     if let Some((fragment, proceed)) = handshake {
@@ -684,6 +729,28 @@ async fn second_choice_cannot_supply_missing_first_choice_content_or_finish_reas
 }
 
 #[tokio::test]
+async fn null_tool_calls_in_text_deltas_are_accepted() {
+    let body = format!(
+        "{}{}data: [DONE]\n\n",
+        event(json!({"choices": [{"delta": {"content": "plain", "tool_calls": null}}]})),
+        event(json!({"choices": [{"delta": {"tool_calls": null}, "finish_reason": "stop"}]}))
+    );
+    let (output, requests, _) = run(
+        b"first\nsecond\n",
+        vec![Reply::Http(200, body), answer("ok")],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "plain\nok\n");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].body["messages"][2],
+        json!({"role": "assistant", "content": "plain"})
+    );
+}
+
+#[tokio::test]
 async fn first_non_null_finish_reason_is_retained_until_done() {
     let body = format!(
         "{}{}{}data: [DONE]\n\n",
@@ -827,7 +894,9 @@ async fn invalid_batch_stops_before_any_command_or_next_input() {
         json!({"index":1,"id":"bad","type":"function",
             "function":{"name":"bash","arguments":"{"}}),
         json!({"index":1,"id":"bad","type":"function",
-            "function":{"name":"read","arguments":"{}"}}),
+            "function":{"name":"read","arguments":"{\"command\":\"ls\"}"}}),
+        json!({"index":1,"id":"bad","type":"other",
+            "function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}),
     ] {
         let (output, requests, _) = run(
             b"work\nqueued\n",
@@ -863,8 +932,9 @@ async fn missing_bash_is_a_fatal_launch_error() {
 #[tokio::test]
 async fn command_stdin_is_eof_and_large_output_is_only_preview_truncated() {
     let command = "if read -r line; then printf stolen; else printf eof; fi; printf '%0100000d' 0";
-    let (output, requests, _) = run(
-        b"work\nqueued\n/exit\n",
+    let (output, requests, _) = run_with_deferred_input(
+        b"work\n",
+        b"queued\n/exit\n",
         vec![
             tool_reply(vec![bash_call(0, "a", command)]),
             answer("done"),
@@ -876,6 +946,7 @@ async fn command_stdin_is_eof_and_large_output_is_only_preview_truncated() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(stdout(&output), "done\nnext\n");
     assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].body["messages"][5]["content"], "queued");
     let result = requests[1].body["messages"][3]["content"].as_str().unwrap();
     assert_eq!(result.len(), "Exit code: 0\neof".len() + 100_000);
     assert!(result.starts_with("Exit code: 0\neof"));
