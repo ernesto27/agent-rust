@@ -123,10 +123,33 @@ async fn run_with_handshake(
     configure: impl FnOnce(&mut Command),
     handshake: Option<(&[u8], oneshot::Sender<()>)>,
 ) -> (Output, Vec<Request>, PathBuf) {
+    run_full(input, None, replies, configure, handshake).await
+}
+
+/// Like `run`, but keeps stdin open and writes `deferred` only after the mock
+/// has received the first request, so the REPL cannot have buffered it.
+async fn run_with_deferred_input(
+    input: &[u8],
+    deferred: &[u8],
+    replies: Vec<Reply>,
+    configure: impl FnOnce(&mut Command),
+) -> (Output, Vec<Request>, PathBuf) {
+    run_full(input, Some(deferred), replies, configure, None).await
+}
+
+async fn run_full(
+    input: &[u8],
+    deferred: Option<&[u8]>,
+    replies: Vec<Reply>,
+    configure: impl FnOnce(&mut Command),
+    handshake: Option<(&[u8], oneshot::Sender<()>)>,
+) -> (Output, Vec<Request>, PathBuf) {
     let cwd = TestDir::new();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_url = format!("http://{}/v1///", listener.local_addr().unwrap());
     let (stop, mut stopped) = oneshot::channel();
+    let (first_request, first_received) = oneshot::channel();
+    let mut first_request = Some(first_request);
     let server = tokio::spawn(async move {
         let mut replies: VecDeque<_> = replies.into();
         let mut requests = Vec::new();
@@ -141,6 +164,9 @@ async fn run_with_handshake(
                     .await
                     .expect("client did not finish sending its request"),
             );
+            if let Some(notify) = first_request.take() {
+                let _ = notify.send(());
+            }
             match replies
                 .pop_front()
                 .unwrap_or(Reply::Http(500, "unexpected extra request".to_owned()))
@@ -160,14 +186,22 @@ async fn run_with_handshake(
                     truncated,
                 } => {
                     stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").await.unwrap();
+                    let last = parts.len().saturating_sub(1);
                     for (index, part) in parts.iter().enumerate() {
                         stream
                             .write_all(format!("{:x}\r\n", part.len()).as_bytes())
                             .await
                             .unwrap();
                         stream.write_all(part).await.unwrap();
-                        stream.write_all(b"\r\n").await.unwrap();
                         stream.flush().await.unwrap();
+                        // The client may legitimately close once the final
+                        // payload ends the stream ([DONE] or a fatal chunk),
+                        // so framing after it is best-effort.
+                        let framing = stream.write_all(b"\r\n").await;
+                        if index < last {
+                            framing.unwrap();
+                            stream.flush().await.unwrap();
+                        }
                         if index == 0
                             && let Some(proceed) = after_first.take()
                         {
@@ -178,7 +212,8 @@ async fn run_with_handshake(
                         }
                     }
                     if !truncated {
-                        stream.write_all(b"0\r\n\r\n").await.unwrap();
+                        let _ = stream.write_all(b"0\r\n\r\n").await;
+                        let _ = stream.flush().await;
                     }
                 }
             }
@@ -201,6 +236,16 @@ async fn run_with_handshake(
     let mut child = command.spawn().unwrap();
     let mut stdin = child.stdin.take().unwrap();
     stdin.write_all(input).await.unwrap();
+    if let Some(deferred) = deferred {
+        stdin.flush().await.unwrap();
+        timeout(Duration::from_secs(5), first_received)
+            .await
+            .expect("agent did not send its first request")
+            .unwrap();
+        // The REPL is now inside the agent loop, so these bytes stay in the
+        // pipe where only a child inheriting stdin could consume them.
+        stdin.write_all(deferred).await.unwrap();
+    }
     drop(stdin);
     let mut observed = Vec::new();
     if let Some((fragment, proceed)) = handshake {
@@ -684,6 +729,28 @@ async fn second_choice_cannot_supply_missing_first_choice_content_or_finish_reas
 }
 
 #[tokio::test]
+async fn null_tool_calls_in_text_deltas_are_accepted() {
+    let body = format!(
+        "{}{}data: [DONE]\n\n",
+        event(json!({"choices": [{"delta": {"content": "plain", "tool_calls": null}}]})),
+        event(json!({"choices": [{"delta": {"tool_calls": null}, "finish_reason": "stop"}]}))
+    );
+    let (output, requests, _) = run(
+        b"first\nsecond\n",
+        vec![Reply::Http(200, body), answer("ok")],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "plain\nok\n");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].body["messages"][2],
+        json!({"role": "assistant", "content": "plain"})
+    );
+}
+
+#[tokio::test]
 async fn first_non_null_finish_reason_is_retained_until_done() {
     let body = format!(
         "{}{}{}data: [DONE]\n\n",
@@ -727,4 +794,288 @@ async fn failure_after_observed_second_turn_fragment_never_submits_queued_third_
     assert!(stderr(&output).starts_with("> > Error: "));
     assert!(stderr(&output).contains("Failed to parse Chat Completions stream chunk"));
     assert_eq!(requests.len(), 2);
+}
+
+fn bash_call(index: usize, id: &str, command: &str) -> Value {
+    json!({"index":index,"id":id,"type":"function","function":{
+        "name":"bash","arguments":json!({"command":command}).to_string()
+    }})
+}
+
+fn tool_reply(calls: Vec<Value>) -> Reply {
+    let body = format!(
+        "{}{}data: [DONE]\n\n",
+        event(json!({"choices":[{"delta":{"tool_calls":calls}}]})),
+        event(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}))
+    );
+    Reply::Http(200, body)
+}
+
+#[tokio::test]
+async fn bash_results_nonzero_exits_and_full_history_reach_model() {
+    let command = "printf out; printf err >&2; exit 7";
+    let (output, requests, _) = run(
+        b"do it\nnext\n/exit\n",
+        vec![
+            tool_reply(vec![bash_call(0, "c1", command)]),
+            answer("handled"),
+            answer("remembered"),
+        ],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "handled\nremembered\n");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[1].body["messages"][2],
+        json!({
+            "role":"assistant","content":null,"tool_calls":[{
+                "id":"c1","type":"function","function":{
+                    "name":"bash","arguments":json!({"command":command}).to_string()
+                }
+            }]
+        })
+    );
+    let result = json!({"role":"tool","tool_call_id":"c1",
+        "content":"Exit code: 7\nouterr"});
+    assert_eq!(requests[1].body["messages"][3], result);
+    assert_eq!(requests[2].body["messages"][3], result);
+    assert!(stderr(&output).contains(&format!("$ {command}\n")));
+    for request in &requests {
+        assert_eq!(
+            request.body["tools"],
+            json!([{
+                "type":"function", "function":{
+                    "name":"bash",
+                    "description":"Run a bash command in the current directory.",
+                    "parameters":{
+                        "type":"object", "properties":{"command":{"type":"string"}},
+                        "required":["command"], "additionalProperties":false
+                    }
+                }
+            }])
+        );
+        assert_eq!(request.body["stream"], true);
+    }
+}
+
+#[tokio::test]
+async fn sequential_calls_and_rounds_share_files_but_not_shell_state() {
+    let (output, requests, cwd) = run(b"work\n/exit\n", vec![
+        tool_reply(vec![
+            bash_call(0, "a", "mkdir child; printf first > marker; cd child; export STEP5_LOCAL=changed"),
+            bash_call(1, "b", "printf '%s\\n' \"$PWD\"; printf '%s\\n' \"${STEP5_LOCAL-unset}\"; cat marker; printf '%s' \"$STEP5_INHERITED\""),
+        ]),
+        tool_reply(vec![bash_call(0, "c", "cat marker")]),
+        answer("done"),
+    ], |command| {
+        command.env("STEP5_INHERITED", "inherited").env_remove("STEP5_LOCAL");
+    }).await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "done\n");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[1].body["messages"][4]["content"],
+        format!("Exit code: 0\n{}\nunset\nfirstinherited", cwd.display())
+    );
+    assert_eq!(
+        requests[2].body["messages"][6]["content"],
+        "Exit code: 0\nfirst"
+    );
+    assert_eq!(requests[1].body["messages"][3]["tool_call_id"], "a");
+    assert_eq!(requests[1].body["messages"][4]["tool_call_id"], "b");
+    assert_eq!(requests[2].body["messages"][6]["tool_call_id"], "c");
+}
+
+#[tokio::test]
+async fn invalid_batch_stops_before_any_command_or_next_input() {
+    for invalid in [
+        json!({"index":1,"id":"bad","type":"function",
+            "function":{"name":"bash","arguments":"{"}}),
+        json!({"index":1,"id":"bad","type":"function",
+            "function":{"name":"read","arguments":"{\"command\":\"ls\"}"}}),
+        json!({"index":1,"id":"bad","type":"other",
+            "function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}),
+    ] {
+        let (output, requests, _) = run(
+            b"work\nqueued\n",
+            vec![tool_reply(vec![
+                bash_call(0, "good", "printf MUST_NOT_RUN"),
+                invalid,
+            ])],
+            |_| {},
+        )
+        .await;
+        assert!(!output.status.success());
+        assert_eq!(requests.len(), 1);
+        assert!(!stderr(&output).contains("$ printf MUST_NOT_RUN"));
+        assert_eq!(stdout(&output), "");
+    }
+}
+
+#[tokio::test]
+async fn missing_bash_is_a_fatal_launch_error() {
+    let (output, requests, _) = run(
+        b"work\nqueued\n",
+        vec![tool_reply(vec![bash_call(0, "a", "printf hello")])],
+        |command| {
+            command.env("PATH", "/nonexistent-step5-path");
+        },
+    )
+    .await;
+    assert!(!output.status.success());
+    assert_eq!(requests.len(), 1);
+    assert!(stderr(&output).contains("Failed to start bash"));
+}
+
+#[tokio::test]
+async fn command_stdin_is_eof_and_large_output_is_only_preview_truncated() {
+    let command = "if read -r line; then printf stolen; else printf eof; fi; printf '%0100000d' 0";
+    let (output, requests, _) = run_with_deferred_input(
+        b"work\n",
+        b"queued\n/exit\n",
+        vec![
+            tool_reply(vec![bash_call(0, "a", command)]),
+            answer("done"),
+            answer("next"),
+        ],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "done\nnext\n");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].body["messages"][5]["content"], "queued");
+    let result = requests[1].body["messages"][3]["content"].as_str().unwrap();
+    assert_eq!(result.len(), "Exit code: 0\neof".len() + 100_000);
+    assert!(result.starts_with("Exit code: 0\neof"));
+    assert!(stderr(&output).contains("[preview truncated; full output sent to model]"));
+    assert!(stderr(&output).len() < 5000);
+}
+
+#[tokio::test]
+async fn terminal_controls_reach_model_raw_but_are_escaped_on_stderr() {
+    let command = r"printf 'a\033]52;c;aGk=\007b\r\033[2Kc\n'";
+    let (output, requests, _) = run(
+        b"work\n/exit\n",
+        vec![tool_reply(vec![bash_call(0, "a", command)]), answer("done")],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        requests[1].body["messages"][3]["content"],
+        "Exit code: 0\na\x1b]52;c;aGk=\x07b\r\x1b[2Kc\n"
+    );
+    let stderr = stderr(&output);
+    assert!(!stderr.contains(['\x1b', '\x07', '\r']));
+    assert!(stderr.contains("a\\u{1b}]52;c;aGk=\\u{7}b\\r\\u{1b}[2Kc\n"));
+    assert!(stderr.contains(&format!("$ {command}\n")));
+}
+
+#[tokio::test]
+async fn fragmented_calls_allow_text_and_execute_only_after_complete_stream() {
+    let fragments = [
+        text_event("Working"),
+        event(json!({"choices":[{"delta":{"tool_calls":[{
+            "index":0,"id":"a","type":"function","function":{
+                "name":"bash","arguments":"{\"command\":"
+            }
+        }]}}]})),
+        event(json!({"choices":[{"delta":{"tool_calls":[{
+            "index":0,"function":{"arguments":"\"printf hello\"}"}
+        }]}}]})),
+        event(json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]})),
+        event(json!({"choices":[],"usage":{"prompt_tokens":1}})),
+        "data: [DONE]\n\n".to_owned(),
+    ];
+    let (proceed, receiver) = oneshot::channel();
+    let body = fragments[1..].concat().into_bytes();
+    let (output, requests, _) = run_with_handshake(
+        b"work\n/exit\n",
+        vec![
+            Reply::Stream {
+                parts: vec![fragments[0].clone().into_bytes(), body],
+                after_first: Some(receiver),
+                truncated: false,
+            },
+            answer("done"),
+        ],
+        |_| {},
+        Some((b"Working", proceed)),
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "Working\ndone\n");
+    assert_eq!(
+        requests[1].body["messages"][2],
+        json!({
+            "role":"assistant", "content":"Working", "tool_calls":[{
+                "id":"a", "type":"function", "function":{
+                    "name":"bash", "arguments":"{\"command\":\"printf hello\"}"
+                }
+            }]
+        })
+    );
+    assert_eq!(
+        requests[1].body["messages"][3]["content"],
+        "Exit code: 0\nhello"
+    );
+
+    // A syntactically complete call without [DONE] must never execute.
+    let body = event(json!({"choices":[{"delta":{"tool_calls":[
+        bash_call(0, "a", "printf MUST_NOT_RUN")
+    ]}}]}));
+    let (output, requests, _) = run(b"work\nqueued\n", vec![Reply::Http(200, body)], |_| {}).await;
+    assert!(!output.status.success());
+    assert_eq!(requests.len(), 1);
+    assert!(!stderr(&output).contains("$ printf MUST_NOT_RUN"));
+}
+
+#[tokio::test]
+async fn tools_require_matching_finish_reason_and_done() {
+    for (calls, reason) in [
+        (vec![], Some("tool_calls")),
+        (vec![bash_call(0, "a", "printf MUST_NOT_RUN")], Some("stop")),
+        (vec![bash_call(0, "a", "printf MUST_NOT_RUN")], None),
+    ] {
+        let mut body = event(json!({"choices":[{"delta":{"tool_calls":calls}}]}));
+        if let Some(reason) = reason {
+            body.push_str(&event(
+                json!({"choices":[{"delta":{},"finish_reason":reason}]}),
+            ));
+        }
+        body.push_str("data: [DONE]\n\n");
+        let (output, requests, _) =
+            run(b"work\nqueued\n", vec![Reply::Http(200, body)], |_| {}).await;
+        assert!(!output.status.success());
+        assert_eq!(requests.len(), 1);
+        assert!(!stderr(&output).contains("$ printf MUST_NOT_RUN"));
+    }
+}
+
+#[tokio::test]
+async fn empty_commands_signal_exits_and_lossy_output_are_tool_results() {
+    let (output, requests, _) = run(
+        b"work\n/exit\n",
+        vec![
+            tool_reply(vec![
+                bash_call(0, "empty", ""),
+                bash_call(1, "bytes", "printf '\\377out'; printf err >&2; printf tail"),
+                bash_call(2, "signal", "printf interrupted; kill -TERM $$"),
+            ]),
+            answer("done"),
+        ],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "done\n");
+    assert_eq!(requests.len(), 2);
+    let messages = &requests[1].body["messages"];
+    assert_eq!(messages[3]["content"], "Exit code: 0\n");
+    assert_eq!(messages[4]["content"], "Exit code: 0\n�outerrtail");
+    assert_eq!(messages[5]["content"], "Termination: signal\ninterrupted");
+    assert!(stderr(&output).contains("Termination: signal\ninterrupted\n"));
 }
