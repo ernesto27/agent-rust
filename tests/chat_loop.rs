@@ -955,6 +955,26 @@ async fn command_stdin_is_eof_and_large_output_is_only_preview_truncated() {
 }
 
 #[tokio::test]
+async fn terminal_controls_reach_model_raw_but_are_escaped_on_stderr() {
+    let command = r"printf 'a\033]52;c;aGk=\007b\r\033[2Kc\n'";
+    let (output, requests, _) = run(
+        b"work\n/exit\n",
+        vec![tool_reply(vec![bash_call(0, "a", command)]), answer("done")],
+        |_| {},
+    )
+    .await;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        requests[1].body["messages"][3]["content"],
+        "Exit code: 0\na\x1b]52;c;aGk=\x07b\r\x1b[2Kc\n"
+    );
+    let stderr = stderr(&output);
+    assert!(!stderr.contains(['\x1b', '\x07', '\r']));
+    assert!(stderr.contains("a\\u{1b}]52;c;aGk=\\u{7}b\\r\\u{1b}[2Kc\n"));
+    assert!(stderr.contains(&format!("$ {command}\n")));
+}
+
+#[tokio::test]
 async fn fragmented_calls_allow_text_and_execute_only_after_complete_stream() {
     let fragments = [
         text_event("Working"),
