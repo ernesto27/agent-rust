@@ -45,25 +45,31 @@ impl Tool {
 
     fn definition(self) -> ToolDef {
         let (description, parameters) = match self {
-            Self::Bash => ("Run a bash command in the current directory.", json!({
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"],
-                "additionalProperties": false
-            })),
-            Self::Read => ("Read a UTF-8 text file by line number. Prefer this over cat for reading files.", json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "minLength": 1},
-                    "offset": {"type": "integer", "minimum": 1, "default": 1},
-                    "limit": {
-                        "type": "integer", "minimum": 1,
-                        "maximum": read::MAX_LINES, "default": read::MAX_LINES
-                    }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            })),
+            Self::Bash => (
+                "Run a bash command in the current directory.",
+                json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                    "additionalProperties": false
+                }),
+            ),
+            Self::Read => (
+                "Read a UTF-8 text file by line number. Prefer this over cat for reading files.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "offset": {"type": "integer", "minimum": 1, "default": 1},
+                        "limit": {
+                            "type": "integer", "minimum": 1,
+                            "maximum": read::MAX_LINES, "default": read::MAX_LINES
+                        }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+            ),
         };
         ToolDef {
             kind: "function",
