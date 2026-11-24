@@ -10,6 +10,7 @@ mod openai;
 mod read;
 mod tools;
 mod types;
+mod write;
 
 use types::ChatMessage;
 

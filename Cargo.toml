@@ -10,4 +10,6 @@ futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+similar = "2.7"
+tempfile = "3"
 tokio = { version = "1.54.1", features = ["full"] }

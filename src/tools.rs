@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use crate::{
     bash, read,
     types::{ToolCall, parse_bash_args},
+    write,
 };
 
 #[derive(Serialize)]
@@ -27,15 +28,17 @@ struct FunctionDef {
 pub enum Tool {
     Bash,
     Read,
+    Write,
 }
 
 impl Tool {
-    const ALL: [Self; 2] = [Self::Bash, Self::Read];
+    const ALL: [Self; 3] = [Self::Bash, Self::Read, Self::Write];
 
     fn name(self) -> &'static str {
         match self {
             Self::Bash => "bash",
             Self::Read => "read",
+            Self::Write => "write",
         }
     }
 
@@ -70,6 +73,18 @@ impl Tool {
                     "additionalProperties": false
                 }),
             ),
+            Self::Write => (
+                "Create or overwrite a file with the supplied text. Creates missing parent directories.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "content": {"type": "string"}
+                    },
+                    "required": ["path", "content"],
+                    "additionalProperties": false
+                }),
+            ),
         };
         ToolDef {
             kind: "function",
@@ -92,6 +107,7 @@ pub async fn execute(call: &ToolCall, cwd: &Path, stderr: &mut impl Write) -> Re
             let args = parse_bash_args(&call.function.arguments)?;
             bash::run(&args.command, cwd, stderr).await
         }
+        Tool::Write => write::execute(&call.function.arguments, cwd, stderr),
         Tool::Read => {
             let args = match read::parse_args(&call.function.arguments) {
                 Ok(args) => args,

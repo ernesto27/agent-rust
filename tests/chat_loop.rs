@@ -808,6 +808,162 @@ fn read_call(index: usize, id: &str, arguments: &str) -> Value {
     }})
 }
 
+fn write_call(index: usize, id: &str, arguments: &str) -> Value {
+    json!({"index":index,"id":id,"type":"function","function":{
+        "name":"write","arguments":arguments
+    }})
+}
+
+#[tokio::test]
+async fn write_creates_parents_and_overwrites_with_exact_content() {
+    let fixture = TestDir::new();
+    let path = "nested/hello.txt";
+    let first = json!({"path":path,"content":"hi\r\n"}).to_string();
+    let second = json!({"path":path,"content":"bye 🦀\n"}).to_string();
+    let (output, requests, _) = run(
+        b"write a file\n/exit\n",
+        vec![
+            tool_reply(vec![write_call(0, "create", &first)]),
+            tool_reply(vec![write_call(0, "overwrite", &second)]),
+            answer("done"),
+        ],
+        |command| {
+            command.current_dir(&fixture.0);
+        },
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "done\n");
+    assert_eq!(
+        fs::read(fixture.0.join(path)).unwrap(),
+        "bye 🦀\n".as_bytes()
+    );
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[1].body["messages"][3],
+        json!({"role":"tool", "tool_call_id":"create", "content":"Wrote 4 bytes to \"nested/hello.txt\""})
+    );
+    assert_eq!(
+        requests[2].body["messages"][5],
+        json!({"role":"tool", "tool_call_id":"overwrite", "content":"Wrote 9 bytes to \"nested/hello.txt\""})
+    );
+    assert_eq!(
+        stderr(&output),
+        "> write \"nested/hello.txt\"\n@@ -0,0 +1 @@\n+hi\\r\nwrite \"nested/hello.txt\"\n@@ -1 +1 @@\n-hi\\r\n+bye 🦀\n> "
+    );
+}
+
+#[tokio::test]
+async fn write_bounds_the_preview_without_truncating_the_file() {
+    let fixture = TestDir::new();
+    let boundary = "\0".repeat(64 * 1024);
+    let over = format!("{boundary}x");
+    let first = json!({"path":"boundary","content":boundary}).to_string();
+    let second = json!({"path":"over","content":over}).to_string();
+    let (output, requests, _) = run(
+        b"write two files\n/exit\n",
+        vec![
+            tool_reply(vec![
+                write_call(0, "boundary", &first),
+                write_call(1, "over", &second),
+            ]),
+            answer("done"),
+        ],
+        |command| {
+            command.current_dir(&fixture.0);
+        },
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "done\n");
+    assert_eq!(
+        fs::read(fixture.0.join("boundary")).unwrap(),
+        boundary.as_bytes()
+    );
+    assert_eq!(fs::read(fixture.0.join("over")).unwrap(), over.as_bytes());
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "> write \"boundary\"\n@@ -0,0 +1 @@\n+{}\n[diff preview truncated]\nwrite \"over\"\n[diff omitted: file exceeds 64 KiB]\n> ",
+            "\\u{0}".repeat(4096 - "@@ -0,0 +1 @@\n+".len())
+        )
+    );
+    assert_eq!(requests.len(), 2);
+    for (index, (id, content)) in [
+        ("boundary", "Wrote 65536 bytes to \"boundary\""),
+        ("over", "Wrote 65537 bytes to \"over\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            requests[1].body["messages"][3 + index],
+            json!({"role":"tool","tool_call_id":id,"content":content})
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_rejections_leave_existing_files_and_the_batch_intact() {
+    let fixture = TestDir::new();
+    fs::write(fixture.0.join("target"), b"keep\n").unwrap();
+    std::os::unix::fs::symlink("target", fixture.0.join("link")).unwrap();
+    let (output, requests, _) = run(
+        b"try writing\n/exit\n",
+        vec![
+            tool_reply(vec![
+                write_call(0, "bad", r#"{"path":"new/file"}"#),
+                write_call(1, "link", r#"{"path":"link","content":"no"}"#),
+                write_call(2, "dir", r#"{"path":".","content":"no"}"#),
+                write_call(3, "empty", r#"{"path":"empty","content":""}"#),
+            ]),
+            answer("handled"),
+        ],
+        |command| {
+            command.current_dir(&fixture.0);
+        },
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "handled\n");
+    assert_eq!(
+        stderr(&output),
+        "> write: invalid arguments\nwrite \"link\"\nwrite \".\"\nwrite \"empty\"\n> "
+    );
+    assert_eq!(requests.len(), 2);
+    for (index, (id, content)) in [
+        (
+            "bad",
+            "Error: write arguments: missing field `content` at line 1 column 19",
+        ),
+        (
+            "link",
+            "Error: write \"link\": destination must be a regular file",
+        ),
+        (
+            "dir",
+            "Error: write \".\": destination must be a regular file",
+        ),
+        ("empty", "Wrote 0 bytes to \"empty\""),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            requests[1].body["messages"][3 + index],
+            json!({"role":"tool","tool_call_id":id,"content":content})
+        );
+    }
+    assert_eq!(fs::read(fixture.0.join("target")).unwrap(), b"keep\n");
+    assert_eq!(
+        fs::read_link(fixture.0.join("link")).unwrap(),
+        std::path::Path::new("target")
+    );
+    assert!(!fixture.0.join("new").exists());
+    assert_eq!(fs::read(fixture.0.join("empty")).unwrap(), b"");
+}
+
 fn tool_reply(calls: Vec<Value>) -> Reply {
     let body = format!(
         "{}{}data: [DONE]\n\n",
@@ -872,6 +1028,16 @@ async fn bash_results_nonzero_exits_and_full_history_reach_model() {
                             "limit":{"type":"integer","minimum":1,"maximum":2000,"default":2000}
                         },
                         "required":["path"], "additionalProperties":false
+                    }
+                }
+            }, {
+                "type":"function", "function":{
+                    "name":"write",
+                    "description":"Create or overwrite a file with the supplied text. Creates missing parent directories.",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"path":{"type":"string","minLength":1},"content":{"type":"string"}},
+                        "required":["path","content"], "additionalProperties":false
                     }
                 }
             }])
