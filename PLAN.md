@@ -130,7 +130,7 @@ HTTP mocks and throwaway directories. Step 6 Bash guardrails remain deferred.
 ### Step 8: `write` and `edit` tools
 - [x] `write { path, content }` creates parent directories and overwrites the file. It writes the supplied UTF-8 bytes verbatim, refuses a symlink or other non-regular file as the final destination, and returns a short confirmation. A bounded diff preview goes to stderr, not to the model.
 - [ ] `edit { path, old_text, new_text }`, exact replacement only (like pi):
-  - [ ] Error if `old_text` is not found: "not found, re-read the file".
+  - [ ] Error if `old_texi wat` is not found: "not found, re-read the file".
   - [ ] Error if it is found more than once: "found N times, add more surrounding context".
 - [ ] Return a short confirmation; print a small diff with `similar` for the human.
 - [ ] For `edit`, keep the original line endings (`\r\n` vs `\n`).

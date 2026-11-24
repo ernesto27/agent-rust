@@ -6,6 +6,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 
 mod bash;
+mod edit;
 mod openai;
 mod read;
 mod tools;

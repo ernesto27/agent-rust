@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
-    bash, read,
+    bash, edit, read,
     types::{ToolCall, parse_bash_args},
     write,
 };
@@ -29,16 +29,18 @@ pub enum Tool {
     Bash,
     Read,
     Write,
+    Edit,
 }
 
 impl Tool {
-    const ALL: [Self; 3] = [Self::Bash, Self::Read, Self::Write];
+    const ALL: [Self; 4] = [Self::Bash, Self::Read, Self::Write, Self::Edit];
 
     fn name(self) -> &'static str {
         match self {
             Self::Bash => "bash",
             Self::Read => "read",
             Self::Write => "write",
+            Self::Edit => "edit",
         }
     }
 
@@ -85,6 +87,19 @@ impl Tool {
                     "additionalProperties": false
                 }),
             ),
+            Self::Edit => (
+                "Replace exactly one occurrence of old_text in an existing UTF-8 file. Use surrounding context for a unique match.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "minLength": 1},
+                        "old_text": {"type": "string", "minLength": 1},
+                        "new_text": {"type": "string"}
+                    },
+                    "required": ["path", "old_text", "new_text"],
+                    "additionalProperties": false
+                }),
+            ),
         };
         ToolDef {
             kind: "function",
@@ -108,6 +123,7 @@ pub async fn execute(call: &ToolCall, cwd: &Path, stderr: &mut impl Write) -> Re
             bash::run(&args.command, cwd, stderr).await
         }
         Tool::Write => write::execute(&call.function.arguments, cwd, stderr),
+        Tool::Edit => edit::execute(&call.function.arguments, cwd, stderr),
         Tool::Read => {
             let args = match read::parse_args(&call.function.arguments) {
                 Ok(args) => args,

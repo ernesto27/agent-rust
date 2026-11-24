@@ -964,6 +964,152 @@ async fn write_rejections_leave_existing_files_and_the_batch_intact() {
     assert_eq!(fs::read(fixture.0.join("empty")).unwrap(), b"");
 }
 
+fn edit_call(index: usize, id: &str, path: &str, old_text: &str, new_text: &str) -> Value {
+    json!({"index":index,"id":id,"type":"function","function":{
+        "name":"edit","arguments":json!({"path":path,"old_text":old_text,"new_text":new_text}).to_string()
+    }})
+}
+
+#[tokio::test]
+async fn edit_replaces_one_match_and_keeps_diff_out_of_tool_result() {
+    let fixture = TestDir::new();
+    let (output, requests, _) = run(
+        b"create hello.py that prints hi, then change it to print bye\n/exit\n",
+        vec![
+            tool_reply(vec![write_call(
+                0,
+                "create",
+                r#"{"path":"hello.py","content":"print('hi')\n"}"#,
+            )]),
+            tool_reply(vec![edit_call(
+                0,
+                "edit",
+                "hello.py",
+                "print('hi')",
+                "print('bye')",
+            )]),
+            answer("done"),
+        ],
+        |command| {
+            command.current_dir(&fixture.0);
+        },
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "done\n");
+    assert_eq!(
+        stderr(&output),
+        "> write \"hello.py\"\n@@ -0,0 +1 @@\n+print('hi')\nedit \"hello.py\"\n@@ -1 +1 @@\n-print('hi')\n+print('bye')\n> "
+    );
+    assert_eq!(
+        fs::read(fixture.0.join("hello.py")).unwrap(),
+        b"print('bye')\n"
+    );
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2].body["messages"][5],
+        json!({
+            "role":"tool", "tool_call_id":"edit", "content":"Edited \"hello.py\""
+        })
+    );
+}
+
+#[tokio::test]
+async fn edit_rejects_missing_and_ambiguous_text_without_changing_files() {
+    let fixture = TestDir::new();
+    fs::write(fixture.0.join("sample"), "aaa\n").unwrap();
+    let (output, requests, _) = run(
+        b"try edits\n/exit\n",
+        vec![
+            tool_reply(vec![
+                edit_call(0, "absent", "sample", "A", "x"),
+                edit_call(1, "multiple", "sample", "aa", "x"),
+                edit_call(2, "empty", "sample", "", "x"),
+            ]),
+            answer("handled"),
+        ],
+        |command| {
+            command.current_dir(&fixture.0);
+        },
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "handled\n");
+    assert_eq!(
+        stderr(&output),
+        "> edit \"sample\"\nedit \"sample\"\nedit: invalid arguments\n> "
+    );
+    assert_eq!(fs::read(fixture.0.join("sample")).unwrap(), b"aaa\n");
+    assert_eq!(requests.len(), 2);
+    for (index, (id, content)) in [
+        (
+            "absent",
+            "Error: edit \"sample\": not found, re-read the file",
+        ),
+        (
+            "multiple",
+            "Error: edit \"sample\": found 2 times, add more surrounding context",
+        ),
+        ("empty", "Error: edit arguments: old_text must not be empty"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(
+            requests[1].body["messages"][3 + index],
+            json!({"role":"tool","tool_call_id":id,"content":content})
+        );
+    }
+}
+
+#[tokio::test]
+async fn edit_preserves_crlf_bom_and_missing_final_newline() {
+    let fixture = TestDir::new();
+    fs::write(fixture.0.join("sample"), b"\xef\xbb\xbfhi\r\nold\r\ntail").unwrap();
+    fs::write(fixture.0.join("explicit"), "\u{feff}hi\r\ntail\r\n").unwrap();
+    let (output, requests, _) = run(
+        b"edit the first two lines\n/exit\n",
+        vec![
+            tool_reply(vec![
+                edit_call(0, "edit", "sample", "hi\nold", "bye\nnew"),
+                edit_call(1, "explicit", "explicit", "\u{feff}hi\n", ""),
+            ]),
+            answer("done"),
+        ],
+        |command| {
+            command.current_dir(&fixture.0);
+        },
+    )
+    .await;
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "done\n");
+    assert_eq!(
+        stderr(&output),
+        concat!(
+            "> edit \"sample\"\n@@ -1,3 +1,3 @@\n-\u{feff}hi\\r\n-old\\r\n+\u{feff}bye\\r\n+new\\r\n tail\n\\ No newline at end of file\n",
+            "edit \"explicit\"\n@@ -1,2 +1 @@\n-\u{feff}hi\\r\n tail\\r\n> "
+        )
+    );
+    assert_eq!(
+        fs::read(fixture.0.join("sample")).unwrap(),
+        b"\xef\xbb\xbfbye\r\nnew\r\ntail"
+    );
+    assert_eq!(fs::read(fixture.0.join("explicit")).unwrap(), b"tail\r\n");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[1].body["messages"][4],
+        json!({
+            "role":"tool", "tool_call_id":"explicit", "content":"Edited \"explicit\""
+        })
+    );
+    assert_eq!(
+        requests[1].body["messages"][3],
+        json!({
+            "role":"tool", "tool_call_id":"edit", "content":"Edited \"sample\""
+        })
+    );
+}
+
 fn tool_reply(calls: Vec<Value>) -> Reply {
     let body = format!(
         "{}{}data: [DONE]\n\n",
@@ -1038,6 +1184,16 @@ async fn bash_results_nonzero_exits_and_full_history_reach_model() {
                         "type":"object",
                         "properties":{"path":{"type":"string","minLength":1},"content":{"type":"string"}},
                         "required":["path","content"], "additionalProperties":false
+                    }
+                }
+            }, {
+                "type":"function", "function":{
+                    "name":"edit",
+                    "description":"Replace exactly one occurrence of old_text in an existing UTF-8 file. Use surrounding context for a unique match.",
+                    "parameters":{
+                        "type":"object",
+                        "properties":{"path":{"type":"string","minLength":1},"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"}},
+                        "required":["path","old_text","new_text"], "additionalProperties":false
                     }
                 }
             }])

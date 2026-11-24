@@ -11,6 +11,7 @@ use similar::TextDiff;
 use tempfile::NamedTempFile;
 
 const DIFF_INPUT_LIMIT: usize = 64 * 1024;
+const TOO_LARGE: &str = "[diff omitted: file exceeds 64 KiB]\n";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -63,6 +64,16 @@ fn replace(path: &Path, content: &str) -> Result<String> {
     let diff = build_preview(path, permissions.is_some(), content)?;
 
     fs::create_dir_all(parent).context("failed to create parent directories")?;
+    persist(path, parent, content, permissions)?;
+    Ok(diff)
+}
+
+pub(crate) fn persist(
+    path: &Path,
+    parent: &Path,
+    content: &str,
+    permissions: Option<Permissions>,
+) -> Result<()> {
     // Stage beside the destination so a failed write never truncates the original.
     let mut staged = NamedTempFile::new_in(parent).context("failed to stage file")?;
     staged
@@ -81,7 +92,7 @@ fn replace(path: &Path, content: &str) -> Result<String> {
             .persist_noclobber(path)
             .context("failed to create destination")?;
     }
-    Ok(diff)
+    Ok(())
 }
 
 fn ordinary_permissions(permissions: Permissions) -> Permissions {
@@ -95,7 +106,6 @@ fn ordinary_permissions(permissions: Permissions) -> Permissions {
 }
 
 fn build_preview(path: &Path, exists: bool, content: &str) -> Result<String> {
-    const TOO_LARGE: &str = "[diff omitted: file exceeds 64 KiB]\n";
     if content.len() > DIFF_INPUT_LIMIT {
         return Ok(TOO_LARGE.into());
     }
@@ -113,6 +123,13 @@ fn build_preview(path: &Path, exists: bool, content: &str) -> Result<String> {
     let Ok(old) = std::str::from_utf8(&old) else {
         return Ok("[diff omitted: destination is not UTF-8]\n".into());
     };
+    Ok(render_preview(old, content))
+}
+
+pub(crate) fn render_preview(old: &str, content: &str) -> String {
+    if old.len().max(content.len()) > DIFF_INPUT_LIMIT {
+        return TOO_LARGE.into();
+    }
     let diff = TextDiff::configure()
         .timeout(Duration::from_millis(100))
         .diff_lines(old, content);
@@ -142,5 +159,5 @@ fn build_preview(path: &Path, exists: bool, content: &str) -> Result<String> {
         }
         shown.push_str("[diff preview truncated]\n");
     }
-    Ok(shown)
+    shown
 }
